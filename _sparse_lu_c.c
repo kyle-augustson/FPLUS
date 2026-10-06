@@ -2821,6 +2821,15 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
             int64_t n_nonpiv = 0, top = n;
             for (int64_t q = np_off[ci]; q < np_off[ci + 1]; q++) { int64_t i = np.a[q]; W->nonpiv[n_nonpiv++] = i; W->wrow[i] = stamp2; }
             const int64_t n_np0 = n_nonpiv;
+            /* the supernode open at the panel start: a column that reached its pre-panel columns reaches its whole tail, as in
+               the column-at-a-time kernel -- including the columns it gained inside the panel and the rows those relaxed joins
+               appended after this column's pre-panel search.  Without this, such rows can be missing from the column's pattern,
+               and pruning (which assumes the pruning column holds every non-pivotal row of the pruned supernode) then loses them
+               for good: missing fill, a wrong factorization (relax_rows > 0, panel > 1; found on the scipy-splu COLAMD ordering). */
+            if (open0 >= 0 && W->sn[open0].ncols > we_open && W->wsn[open0] != stamp2) {
+                for (int64_t q = ext_off[ci]; q < ext_off[ci + 1]; q++)
+                    if (ext_s.a[q] == open0) { top = sn_dfs(open0, W->sn[open0].first + we_open, top, W, stamp2, open, &n_nonpiv); break; }
+            }
             for (int64_t q = 0; q < n_np0; q++) {
                 int64_t i = W->nonpiv[q], k = pinv[i];
                 if (k < 0) continue;                        /* still non-pivotal */

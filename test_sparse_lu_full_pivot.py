@@ -796,6 +796,24 @@ class TestRelaxPanel:
             be = self._be(sp.csr_matrix(M), x, b)
             assert be < 1e-13, f"trans {tr}: backward error {be:.1e}"
 
+    def test_relaxed_join_inside_panel_regression(self):
+        """Two matrices, stored pre-ordered (colamd=False, so the test does not depend on any ordering library), on which
+        panel > 1 with relaxed joins lost fill: the supernode open at a panel start gained rows inside the panel by a relaxed
+        join, a later panel column that reached only its pre-panel columns missed those rows, and pruning then made them
+        unreachable (backward errors 6e-3 and 2e-4 before the fix).  Every panel width must keep the panel-1 pivots and L."""
+        import os
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data")
+        for name in ("relaxed_panel_case50.npz", "relaxed_panel_case3.npz"):
+            z = np.load(os.path.join(d, name))
+            A = sp.csr_matrix((z["data"], z["indices"], z["indptr"]), shape=(1200, 1200)); b = z["b"]
+            for r in (2, 8):
+                ref = SparseLU(A, colamd=False, relax_rows=r, panel=1)
+                for p in (2, 4, 8, 16):
+                    lu = SparseLU(A, colamd=False, relax_rows=r, panel=p)
+                    be = self._be(A, lu.solve(b), b)
+                    assert be < 1e-13, f"{name} relax {r} panel {p}: backward error {be:.1e}"
+                    assert np.array_equal(lu.perm_r, ref.perm_r) and lu.L.nnz == ref.L.nnz, f"{name} relax {r} panel {p}: structure differs from panel 1"
+
     def test_ordering_cache_is_exact(self):
         from sparse_lu_full_pivot import clear_ordering_cache
         A = banded_plus_random_complex(900)
