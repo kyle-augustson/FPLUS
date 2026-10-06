@@ -83,16 +83,24 @@ from scipy.sparse import csr_matrix, csc_matrix
 from scipy.sparse.linalg import spsolve_triangular
 from typing import Tuple, Optional
 
+_C_EXT_ERROR = None
 try:
     from . import _sparse_lu_c
     _HAVE_C_EXT = True
-except (ImportError, ValueError):
+except (ImportError, ValueError) as _e1:
     # standalone import of the module file
     try:
         import _sparse_lu_c
         _HAVE_C_EXT = True
-    except ImportError:
+    except ImportError as _e2:
         _HAVE_C_EXT = False
+        _C_EXT_ERROR = f"{_e1}; {_e2}"
+if not _HAVE_C_EXT:
+    # the pure-Python fallback is O(n^3) full pivoting: say so loudly (a mislinked extension, e.g. against the wrong
+    # OpenMP runtime, otherwise drops a long factorisation into it without a word)
+    import warnings as _w
+    _w.warn("FPLUS C extension not loaded; using the pure-Python full-pivoting fallback, which is orders of magnitude "
+            f"slower and ignores partial/rook pivoting.  Import error: {_C_EXT_ERROR}", RuntimeWarning, stacklevel=2)
 
 # Pivot strategy enum (must match C-side FPLUS_PIVOT_* macros).
 _PIVOT_FULL    = 0
