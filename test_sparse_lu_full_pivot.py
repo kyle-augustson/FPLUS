@@ -737,9 +737,75 @@ class TestSparseLU:
 # Standalone runner
 # ===========================================================================
 
+# ===========================================================================
+# 8. Relaxed supernodes and supernode-panel updates (partial pivoting)
+# ===========================================================================
+
+def banded_plus_random_complex(n, bw=6, density=0.004):
+    """complex, not diagonally dominant: a band (supernodes form) plus scattered entries (near-nesting patterns)"""
+    from scipy.sparse import random as sp_random
+    offs = list(range(-bw, bw + 1))
+    diags = [RNG.standard_normal(n - abs(k)) + 1j * RNG.standard_normal(n - abs(k)) for k in offs]
+    B = sp.diags(diags, offs, shape=(n, n), format="csr", dtype=np.complex128)
+    R = sp_random(n, n, density=density, format="csr", random_state=RNG) * (1 + 1j)
+    return (B + R + 0.5 * speye(n, dtype=np.complex128)).tocsr()
+
+
+class TestRelaxPanel:
+    """relax_rows and panel change only how the factorization is computed: the backward error stays at round-off, the
+    solution matches the exact-supernode column-at-a-time path, and panel > 1 keeps the pivots of panel = 1"""
+    COMBOS = [(r, p) for r in (0, 2, 8) for p in (1, 4, 32)]
+
+    def _be(self, A, x, b):
+        return np.linalg.norm(A @ x - b) / (sp.linalg.norm(A, 1) * np.linalg.norm(x) + np.linalg.norm(b))
+
+    def test_backward_error_and_agreement(self):
+        for n in (300, 1200):
+            A = banded_plus_random_complex(n)
+            b = RNG.standard_normal(n) + 1j * RNG.standard_normal(n)
+            x0 = SparseLU(A, colamd=True, pin_dense_rows=True).solve(b)
+            for r, p in self.COMBOS:
+                lu = SparseLU(A, colamd=True, pin_dense_rows=True, relax_rows=r, panel=p)
+                x = lu.solve(b)
+                be = self._be(A, x, b)
+                assert be < 1e-13, f"n {n} relax {r} panel {p}: backward error {be:.1e}"
+                d = np.linalg.norm(x - x0) / np.linalg.norm(x0)
+                assert d < 1e-8, f"n {n} relax {r} panel {p}: differs from relax 0 panel 1 by {d:.1e}"
+
+    def test_panel_keeps_pivots(self):
+        A = banded_plus_random_complex(1500)
+        for r in (0, 2):
+            ref = SparseLU(A, colamd=True, relax_rows=r, panel=1)
+            for p in (4, 32):
+                lu = SparseLU(A, colamd=True, relax_rows=r, panel=p)
+                assert np.array_equal(lu.perm_r, ref.perm_r), f"relax {r} panel {p}: pivots differ"
+                assert lu.L.nnz == ref.L.nnz, f"relax {r} panel {p}: nnz(L) {lu.L.nnz} vs {ref.L.nnz}"
+
+    def test_relax_merges_supernodes_with_bounded_fill(self):
+        A = banded_plus_random_complex(1500)
+        nz0 = SparseLU(A, colamd=True).nnz
+        nz2 = SparseLU(A, colamd=True, relax_rows=2).nnz
+        assert nz0 <= nz2 <= 1.5 * nz0, f"fill {nz0} -> {nz2}"
+
+    def test_transposed_solves_after_panel(self):
+        A = banded_plus_random_complex(800)
+        lu = SparseLU(A, colamd=True, relax_rows=2, panel=16)
+        b = RNG.standard_normal(800) + 1j * RNG.standard_normal(800)
+        for tr, M in (("T", A.T), ("H", A.conj().T)):
+            x = lu.solve(b, trans=tr)
+            be = self._be(sp.csr_matrix(M), x, b)
+            assert be < 1e-13, f"trans {tr}: backward error {be:.1e}"
+
+    def test_real_matrix_ignores_panel(self):
+        A = diag_dom_real(400, density=0.02)
+        b = RNG.standard_normal(400)
+        x = SparseLU(A, colamd=True, relax_rows=2, panel=8).solve(b)
+        assert self._be(A, x, b) < 1e-13
+
+
 if __name__ == "__main__":
     suites = [TestFactorisation, TestSolve, TestSparsity, TestCOLAMD,
-              TestInputFormats, TestEdgeCases, TestSparseLU]
+              TestInputFormats, TestEdgeCases, TestSparseLU, TestRelaxPanel]
     passed = failed = 0
     for cls in suites:
         obj = cls()

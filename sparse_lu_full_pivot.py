@@ -129,6 +129,9 @@ def sparse_lu_full_pivot(
     pivot_strategy: str = "partial",
     dtype=None,
     verbose: int = 0,
+    relax_rows: int = 0,
+    panel: int = 1,
+    _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
     """
@@ -226,6 +229,23 @@ def sparse_lu_full_pivot(
             2 : adds periodic factorization progress (~20 progress lines)
                 and per-iteration Ruiz residual
 
+    relax_rows : int, optional
+        Supernodal partial pivoting only.  A column joins the open
+        supernode when its L pattern differs from the supernode's by at
+        most this many rows; the difference is stored as explicit zeros
+        (relaxed supernodes).  Default 0 = exact supernodes.  On complex
+        spectral-MHD test pencils 2 merges ~93 percent of the near-misses
+        (mean supernode width 1.9 -> 26 at n = 100k) for ~6 percent more
+        fill.
+
+    panel : int, optional
+        Supernodal partial pivoting, complex matrices, BLAS build only.
+        Columns are processed in panels of this width: each supernode
+        complete before the panel is applied to every panel column it
+        reaches at once (ztrsm + zgemm), the within-panel updates per
+        column.  Default 1 = one column at a time.  Same pivots as
+        panel=1; 32 gave 3.2x at n = 100k with relax_rows=2.
+
     Returns
     -------
     L  : csr_matrix  — unit lower-triangular factor
@@ -314,7 +334,7 @@ def sparse_lu_full_pivot(
     if _HAVE_C_EXT:
         L, U, p_lu, q_lu, Dr, Dc = _lu_factor_c(
             A_work, n, drop_tol, equilibrate, is_complex, dtype,
-            verbose, pivot_code)
+            verbose, pivot_code, _return_csc, relax_rows, panel)
     else:
         if pivot_strategy != "full":
             import warnings
@@ -543,7 +563,7 @@ class SparseLU:
     def __init__(self, A, **kwargs):
         A_sp = sp.csr_matrix(A)
         self._A = A_sp
-        L, U, p, q, Dr, Dc = sparse_lu_full_pivot(A_sp, **kwargs)
+        L, U, p, q, Dr, Dc = sparse_lu_full_pivot(A_sp, _return_csc=True, **kwargs)
         self._L  = L.tocsc()
         self._U  = U.tocsc()
         self._L_arrays = _factor_arrays(self._L)
@@ -938,7 +958,7 @@ def _ruiz_c(A_csr, n, is_complex, target_dtype, verbose=0):
 
 
 def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
-                 verbose=0, pivot_code=_PIVOT_PARTIAL):
+                 verbose=0, pivot_code=_PIVOT_PARTIAL, return_csc=False, relax_rows=0, panel=1):
     target_dtype = np.complex128 if is_complex else np.float64
     A_csr = A.astype(target_dtype).tocsr()
     A_csr.sort_indices()
@@ -960,8 +980,9 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
             np.ascontiguousarray(A_csc.data, dtype=target_dtype),
             A_csc.indices.astype(np.int64, copy=False),
             A_csc.indptr.astype(np.int64, copy=False),
-            n, int(is_complex), int(verbose))
-        fmt = lambda *a, **k: csc_matrix(*a, **k).tocsr()   # noqa: E731
+            n, int(is_complex), int(verbose), int(relax_rows), int(panel))
+        # the kernel returns CSC; SparseLU keeps it (return_csc), the public function returns CSR
+        fmt = csc_matrix if return_csc else (lambda *a, **k: csc_matrix(*a, **k).tocsr())   # noqa: E731
     else:
         raw = _sparse_lu_c.lu_factor(
             data, indices, indptr, n, float(drop_tol), int(is_complex),

@@ -143,6 +143,10 @@ extern void cblas_ztrsv(int order, int uplo, int trans, int diag, int N,
 extern void cblas_dgemv(int order, int trans, int M, int N, double alpha,
                         const double *A, int lda, const double *X, int incX,
                         double beta, double *Y, int incY);
+extern void cblas_ztrsm(int order, int side, int uplo, int transa, int diag, int M, int N,
+                        const void *alpha, const void *A, int lda, void *B, int ldb);
+extern void cblas_zgemm(int order, int transa, int transb, int M, int N, int K, const void *alpha,
+                        const void *A, int lda, const void *B, int ldb, const void *beta, void *C, int ldc);
 extern void cblas_zgemv(int order, int trans, int M, int N, const void *alpha,
                         const void *A, int lda, const void *X, int incX,
                         const void *beta, void *Y, int incY);
@@ -2238,6 +2242,8 @@ typedef struct {
     int64_t *segfirst;  /* first column reached per supernode, this column */
     int64_t *xi;        /* reached supernodes in topological order at xi[top..n) */
     int64_t *nonpiv;    /* non-pivotal rows of the pattern */
+    int64_t *miss;      /* rows of column j missing from the open supernode (relaxed join) */
+    int64_t relax_rows; /* relaxed join: at most this many rows of pattern mismatch (0 = exact supernodes) */
     int64_t *pstack, *head;
     int64_t *Up, *Ui;  void *Ux;  int64_t nnzU, capU;
     void *x, *y;        /* accumulator and the dense work vector */
@@ -2302,6 +2308,27 @@ static int64_t sn_dfs(int64_t root, int64_t col, int64_t top, SnWork *W, int64_t
     return top;
 }
 
+/* append k rows to the open supernode: zeros in every stored column (a relaxed join) */
+static int sn_add_rows(Supernode *S, const int64_t *rows_new, int64_t k, int64_t *rowpos, int is_complex)
+{
+    const size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
+    const int64_t r1 = S->nrows, nr = r1 + k;
+    int64_t *nrw = (int64_t *)realloc(S->rows, (size_t)nr * sizeof(int64_t));
+    if (!nrw) return -1;
+    S->rows = nrw;
+    char *nb = (char *)malloc((size_t)S->cap * (size_t)nr * vs);
+    if (!nb) return -1;
+    const char *ob = (const char *)S->blk;
+    for (int64_t c = 0; c < S->ncols; c++) {
+        memcpy(nb + (size_t)c * nr * vs, ob + (size_t)c * r1 * vs, (size_t)r1 * vs);
+        memset(nb + ((size_t)c * nr + r1) * vs, 0, (size_t)k * vs);
+    }
+    free(S->blk); S->blk = nb;
+    for (int64_t i = 0; i < k; i++) { nrw[r1 + i] = rows_new[i]; rowpos[rows_new[i]] = r1 + i; }
+    S->nrows = nr;
+    return 0;
+}
+
 static int sn_grow_cols(Supernode *S, int64_t need, int is_complex)
 {
     if (need <= S->cap) return 0;
@@ -2320,6 +2347,34 @@ static int sn_grow_cols(Supernode *S, int64_t need, int is_complex)
 #  define SN_BLAS(m, nrest) 0
 #endif
 
+/* ---- profiling (compile with -DFPLUS_PROFILE; no effect otherwise) ---- */
+#ifdef FPLUS_PROFILE
+#define NPH 8
+static const char *PH_NAME[NPH] = {"symbolic DFS", "scatter A[:,j]", "updates (BLAS path)", "updates (loop path)", "pivot search",
+                                   "U store", "L store / supernode", "clear + prune"};
+static struct { double t[NPH]; double fl_blas, fl_loop, by_blas, by_loop, fl_w[24], fl_reuse; int64_t n_upd, n_upd_blas, mm[24], mm_rows[24];
+                int64_t prev_sn_stamp_dummy; int64_t n_relax; double zeros; } SNP;
+static int64_t *SNP_last;   /* last column each supernode updated */
+static inline int ilog2_i64(int64_t v) { int b = 0; while (v > 1 && b < 23) { v >>= 1; b++; } return b; }
+#define PROF_DECL double _tl = wall_time(); double _tu;
+#define PROF_MARK(k) do { double _t = wall_time(); SNP.t[k] += _t - _tl; _tl = _t; } while (0)
+#define PROF_UPD_BEGIN() do { _tu = wall_time(); } while (0)
+#define PROF_UPD_END(blas, m, nrest, w, s, j) do { double _t = wall_time(); double _fl = 8.0 * ((double)(m) * ((m) - 1) / 2 + (double)(m) * (nrest)); \
+        double _by = 16.0 * ((double)(m) * ((m) + 1) / 2 + (double)(m) * (nrest));                                                          \
+        if (blas) { SNP.t[2] += _t - _tu; SNP.fl_blas += _fl; SNP.by_blas += _by; SNP.n_upd_blas++; }                                     \
+        else { SNP.t[3] += _t - _tu; SNP.fl_loop += _fl; SNP.by_loop += _by; }                                                            \
+        SNP.n_upd++; SNP.fl_w[ilog2_i64(w)] += _fl; if (SNP_last[s] == (j) - 1) SNP.fl_reuse += _fl; SNP_last[s] = (j); _tl = _t; } while (0)
+#define PROF_MISMATCH(missing, extra) do { int64_t _d = (missing) + (extra); SNP.mm[ilog2_i64(_d + 1)]++; } while (0)
+#define PROF_RELAX(nz_) do { SNP.n_relax++; SNP.zeros += (double)(nz_); } while (0)
+#else
+#define PROF_RELAX(nz_) do {} while (0)
+#define PROF_DECL
+#define PROF_MARK(k) do {} while (0)
+#define PROF_UPD_BEGIN() do {} while (0)
+#define PROF_UPD_END(blas, m, nrest, w, s, j) do {} while (0)
+#define PROF_MISMATCH(missing, extra) do {} while (0)
+#endif
+
 #define SN_FACTOR_BODY(NAME, T, ABSF, TRSV, GEMV)                                       \
 static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, int verbose) \
 {                                                                                       \
@@ -2332,6 +2387,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
     double pivot_threshold;                                                             \
     int64_t open = -1;                                                                  \
     for (int64_t j = 0; j < n; j++) {                                                   \
+        PROF_DECL                                                                       \
         const int64_t stamp = j + 1;                                                    \
         int64_t top = n, n_nonpiv = 0;                                                  \
         /* symbolic: the reached supernodes in topological order */                    \
@@ -2345,6 +2401,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             if (W->wsn[s] == stamp) { if (k < W->segfirst[s]) W->segfirst[s] = k; continue; } \
             top = sn_dfs(s, k, top, W, stamp, open, &n_nonpiv);                         \
         }                                                                               \
+        PROF_MARK(0);                                                                   \
         /* numeric: scatter A[:, j] (noting its largest modulus), apply the reached */ \
         /* supernodes */                                                                \
         double colmax = 0.0;                                                            \
@@ -2353,7 +2410,9 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             double a = ABSF(Ax[q]);                                                     \
             if (a > colmax) colmax = a;                                                 \
         }                                                                               \
+        PROF_MARK(1);                                                                   \
         for (int64_t t = top; t < n; t++) {                                             \
+            PROF_UPD_BEGIN();                                                           \
             Supernode *S = &W->sn[xi[t]];                                               \
             const int64_t r1 = S->nrows, w = S->ncols, kf = W->segfirst[xi[t]] - S->first; \
             const T *B = (const T *)S->blk;                                             \
@@ -2379,6 +2438,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
                 }                                                                       \
             }                                                                           \
             for (int64_t r = 0; r < nrest; r++) x[rest[r]] -= y[r];                     \
+            PROF_UPD_END(SN_BLAS(m, nrest), m, nrest, w, xi[t], j);                     \
         }                                                                               \
         /* pivot: the largest modulus among the rows not yet pivotal */                 \
         int64_t pivrow = -1;                                                            \
@@ -2397,6 +2457,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             return -2;                                                                  \
         }                                                                               \
         T piv = x[pivrow];                                                              \
+        PROF_MARK(4);                                                                   \
         /* U[:, j]: the segments of the reached supernodes, then the diagonal */       \
         {                                                                               \
             int64_t need = 1;                                                           \
@@ -2414,14 +2475,23 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             Ui[u] = j; Ux[u] = piv; u++;                                                \
             W->nnzU = u; W->Up[j + 1] = u;                                              \
         }                                                                               \
+        PROF_MARK(5);                                                                   \
         /* L[:, j]: join the open supernode when the pattern nests, else open one */    \
         int join = 0;                                                                   \
+        int64_t n_miss = 0;                                                             \
         if (open >= 0) {                                                                \
             Supernode *S = &W->sn[open];                                                \
-            if (n_nonpiv == S->nrows - S->ncols && rowpos[pivrow] >= S->ncols) {        \
-                join = 1;                                                               \
-                for (int64_t s = 0; s < n_nonpiv; s++)                                  \
-                    if (rowpos[nonpiv[s]] < S->ncols) { join = 0; break; }              \
+            int64_t in_S = 0;                                                           \
+            for (int64_t s = 0; s < n_nonpiv; s++) {                                    \
+                if (rowpos[nonpiv[s]] >= S->ncols) in_S++;                              \
+                else W->miss[n_miss++] = nonpiv[s];                                     \
+            }                                                                           \
+            int64_t extra = (S->nrows - S->ncols) - in_S;                               \
+            if (n_miss + extra == 0) join = 1;                                          \
+            else if (n_miss + extra <= W->relax_rows) join = 2;                         \
+            if (join == 2) {                                                            \
+                if (n_miss > 0 && sn_add_rows(S, W->miss, n_miss, rowpos, is_complex)) return -1; \
+                PROF_RELAX(n_miss * S->ncols + extra);                                  \
             }                                                                           \
         }                                                                               \
         if (join) {                                                                     \
@@ -2449,6 +2519,8 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             if (open >= 0) {                                                            \
                 /* close the open supernode: its rest rows become the search list */    \
                 Supernode *S = &W->sn[open];                                            \
+                { int64_t _in = 0; for (int64_t s_ = 0; s_ < n_nonpiv; s_++) if (rowpos[nonpiv[s_]] >= S->ncols) _in++; \
+                  PROF_MISMATCH(n_nonpiv - _in, (S->nrows - S->ncols) - _in); (void)_in; }  \
                 int64_t nrest = S->nrows - S->ncols;                                    \
                 S->dfs_rows = (int64_t *)malloc((size_t)(nrest > 0 ? nrest : 1) * sizeof(int64_t)); \
                 if (!S->dfs_rows) return -1;                                            \
@@ -2474,6 +2546,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             open = s;                                                                   \
         }                                                                               \
         pinv[pivrow] = j; p[j] = pivrow;                                                \
+        PROF_MARK(6);                                                                   \
         /* clear the accumulator on the pattern */                                      \
         for (int64_t t = 0; t < n_nonpiv; t++) x[nonpiv[t]] = 0;                        \
         for (int64_t t = top; t < n; t++) {                                             \
@@ -2499,6 +2572,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             }                                                                           \
             S->dfs_end = pt;                                                            \
         }                                                                               \
+        PROF_MARK(7);                                                                   \
         if (verbose >= 2 && (j % (n / 20 + 1) == 0 || j == n - 1))                      \
             printf("[FPLUS]   [%5.1f%%] column %ld/%ld  pivot=%.3e  supernodes=%ld\n",  \
                    100.0 * (double)(j + 1) / (double)n, (long)(j + 1), (long)n, best,   \
@@ -2522,9 +2596,372 @@ SN_FACTOR_BODY(sn_factor_z, double complex, cabs, (void), (void))
 SN_FACTOR_BODY(sn_factor_d, double, fabs, (void), (void))
 #endif
 
+
+#ifdef HAVE_BLAS
+/* growable int64 array */
+typedef struct { int64_t *a; int64_t n, cap; } I64V;
+static int i64v_push(I64V *v, int64_t x)
+{
+    if (v->n == v->cap) {
+        int64_t nc = v->cap ? 2 * v->cap : 1024;
+        int64_t *na = (int64_t *)realloc(v->a, (size_t)nc * sizeof(int64_t));
+        if (!na) return -1;
+        v->a = na; v->cap = nc;
+    }
+    v->a[v->n++] = x;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Supernode-panel variant of sn_factor_z (complex only; panel width P > 1).
+ * Per panel [j0, j1): (1) for each column, the search over the supernodes
+ * complete before j0 (its reached list in topological order, segment
+ * starts, the rows non-pivotal at j0) and the scatter of A[:, c] into the
+ * column's own accumulator; (2) one search from all those supernodes gives
+ * a common topological order, and each supernode is applied to every panel
+ * column that reached it at once (gather, ztrsm, zgemm, scatter); (3) per
+ * column in order: a search from its pattern rows that became pivotal
+ * inside the panel, the updates of those (within-panel) supernode segments
+ * one column at a time, then pivot, U and L exactly as in sn_factor_z.
+ * A supernode complete before j0 never reads a row pivoted inside the
+ * panel, so all pre-panel updates first and the within-panel ones after is
+ * a valid order; the open supernode at j0 contributes its columns < j0 in
+ * (2) and its columns >= j0 in (3) (a block split of its triangular solve).
+ * ------------------------------------------------------------------------- */
+static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, const double complex *Ax,
+                             int verbose, int64_t P)
+{
+    typedef double complex T;
+    const int64_t n = W->n;
+    const T ONE = 1, ZERO = 0, MONE = -1;
+    const int is_complex = 1;
+    int64_t *pinv = W->pinv, *p = W->p, *rowpos = W->rowpos, *col_sn = W->col_sn;
+    T *y = (T *)W->y;
+    int64_t open = -1;
+    int rc = -1;
+    T *X = (T *)calloc((size_t)P * (size_t)n, sizeof(T));
+    double *colmax = (double *)malloc((size_t)P * sizeof(double));
+    int64_t *ext_off = (int64_t *)malloc((size_t)(P + 1) * sizeof(int64_t));
+    int64_t *np_off = (int64_t *)malloc((size_t)(P + 1) * sizeof(int64_t));
+    int64_t *uidx = (int64_t *)malloc((size_t)n * sizeof(int64_t));   /* supernode -> union position, stamped by ustamp */
+    int64_t *ustamp = (int64_t *)calloc((size_t)n, sizeof(int64_t));
+    I64V ext_s = {0}, ext_kf = {0}, np = {0}, un = {0}, ucnt = {0}, ucol = {0}, ukf = {0};
+    T *XS = NULL, *YB = NULL; int64_t capXS = 0, capYB = 0;
+    if (!X || !colmax || !ext_off || !np_off || !uidx || !ustamp) goto out;
+    for (int64_t j0 = 0; j0 < n; j0 += P) {
+        const int64_t j1 = (j0 + P < n) ? j0 + P : n, np_ = j1 - j0;
+        const int64_t open0 = open, we_open = open >= 0 ? W->sn[open].ncols : 0;
+        ext_s.n = ext_kf.n = np.n = 0;
+        /* (1) per-column search over the pre-panel supernodes, scatter */
+        for (int64_t ci = 0; ci < np_; ci++) {
+            const int64_t c = j0 + ci, stamp = c + 1;
+            int64_t top = n, n_nonpiv = 0;
+            T *x = X + (size_t)ci * n;
+            for (int64_t q = Ap[c]; q < Ap[c + 1]; q++) {
+                int64_t i = Ai[q], k = pinv[i];
+                if (k < 0) {
+                    if (W->wrow[i] != stamp) { W->wrow[i] = stamp; W->nonpiv[n_nonpiv++] = i; }
+                    continue;
+                }
+                int64_t sn = col_sn[k];
+                if (W->wsn[sn] == stamp) { if (k < W->segfirst[sn]) W->segfirst[sn] = k; continue; }
+                top = sn_dfs(sn, k, top, W, stamp, open, &n_nonpiv);
+            }
+            double cm = 0.0;
+            for (int64_t q = Ap[c]; q < Ap[c + 1]; q++) { x[Ai[q]] += Ax[q]; double a = cabs(Ax[q]); if (a > cm) cm = a; }
+            colmax[ci] = cm;
+            ext_off[ci] = ext_s.n; np_off[ci] = np.n;
+            for (int64_t t = top; t < n; t++) {
+                if (i64v_push(&ext_s, W->xi[t]) || i64v_push(&ext_kf, W->segfirst[W->xi[t]])) goto out;
+            }
+            for (int64_t t = 0; t < n_nonpiv; t++) if (i64v_push(&np, W->nonpiv[t])) goto out;
+        }
+        ext_off[np_] = ext_s.n; np_off[np_] = np.n;
+        /* (2) union order and the batched updates */
+        {
+            const int64_t us = 2 * n + 1 + j0;
+            int64_t top = n, dummy = 0;
+            for (int64_t q = 0; q < ext_s.n; q++) {
+                int64_t sn = ext_s.a[q];
+                if (W->wsn[sn] == us) continue;
+                top = sn_dfs(sn, ext_kf.a[q], top, W, us, open, &dummy);
+                dummy = 0;
+            }
+            un.n = 0;
+            for (int64_t t = top; t < n; t++) { if (i64v_push(&un, W->xi[t])) goto out; uidx[W->xi[t]] = un.n - 1; ustamp[W->xi[t]] = us; }
+            /* columns per union entry (counting sort) */
+            ucnt.n = 0;
+            for (int64_t u = 0; u <= un.n; u++) if (i64v_push(&ucnt, 0)) goto out;
+            for (int64_t q = 0; q < ext_s.n; q++) ucnt.a[uidx[ext_s.a[q]] + 1]++;
+            for (int64_t u = 0; u < un.n; u++) ucnt.a[u + 1] += ucnt.a[u];
+            ucol.n = ukf.n = 0;
+            for (int64_t q = 0; q < ext_s.n; q++) { if (i64v_push(&ucol, 0) || i64v_push(&ukf, 0)) goto out; }
+            {
+                int64_t *fill = (int64_t *)malloc((size_t)(un.n + 1) * sizeof(int64_t));
+                if (!fill) goto out;
+                memcpy(fill, ucnt.a, (size_t)(un.n + 1) * sizeof(int64_t));
+                for (int64_t ci = 0; ci < np_; ci++)
+                    for (int64_t q = ext_off[ci]; q < ext_off[ci + 1]; q++) {
+                        int64_t u = uidx[ext_s.a[q]], pos = fill[u]++;
+                        ucol.a[pos] = ci; ukf.a[pos] = ext_kf.a[q];
+                    }
+                free(fill);
+            }
+#ifdef FPLUS_PROFILE
+            double _tb = wall_time();
+#endif
+            for (int64_t u = 0; u < un.n; u++) {
+                const int64_t sn = un.a[u], c0 = ucnt.a[u], c1 = ucnt.a[u + 1], pc = c1 - c0;
+                if (pc == 0) continue;
+                Supernode *S = &W->sn[sn];
+                const int64_t r1 = S->nrows, we = (sn == open0) ? we_open : S->ncols;
+                int64_t kfa = we;
+                for (int64_t q = c0; q < c1; q++) { int64_t k = ukf.a[q] - S->first; if (k < kfa) kfa = k; }
+                const int64_t m = we - kfa, nrest = r1 - we;
+                if (m <= 0) continue;
+                const T *B = (const T *)S->blk;
+                const int64_t *rows = S->rows;
+                if (capXS < m * pc) { free(XS); capXS = 2 * m * pc; XS = (T *)malloc((size_t)capXS * sizeof(T)); if (!XS) goto out; }
+                if (capYB < nrest * pc) { free(YB); capYB = 2 * nrest * pc + 1; YB = (T *)malloc((size_t)capYB * sizeof(T)); if (!YB) goto out; }
+                for (int64_t q = c0; q < c1; q++) {
+                    const T *x = X + (size_t)ucol.a[q] * n; T *xs = XS + (q - c0) * m;
+                    for (int64_t cc = 0; cc < m; cc++) xs[cc] = x[rows[kfa + cc]];
+                }
+                cblas_ztrsm(102, 141, 122, 111, 132, (int)m, (int)pc, &ONE, B + kfa * r1 + kfa, (int)r1, XS, (int)m);
+                if (nrest > 0)
+                    cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * r1 + we, (int)r1, XS, (int)m, &ZERO, YB, (int)nrest);
+                for (int64_t q = c0; q < c1; q++) {
+                    T *x = X + (size_t)ucol.a[q] * n; const T *xs = XS + (q - c0) * m, *yb = YB + (q - c0) * nrest;
+                    for (int64_t cc = 0; cc < m; cc++) x[rows[kfa + cc]] = xs[cc];
+                    for (int64_t r = 0; r < nrest; r++) x[rows[we + r]] -= yb[r];
+                }
+#ifdef FPLUS_PROFILE
+                SNP.fl_blas += 8.0 * pc * ((double)m * (m - 1) / 2 + (double)m * nrest); SNP.n_upd_blas++; SNP.n_upd++;
+                SNP.fl_w[ilog2_i64(S->ncols)] += 8.0 * pc * ((double)m * (m - 1) / 2 + (double)m * nrest);
+#endif
+            }
+#ifdef FPLUS_PROFILE
+            SNP.t[2] += wall_time() - _tb;
+#endif
+        }
+        (void)MONE;
+        /* (3) per column: within-panel updates, pivot, U, L */
+        for (int64_t ci = 0; ci < np_; ci++) {
+            const int64_t j = j0 + ci, stamp2 = n + 1 + j;
+            T *x = X + (size_t)ci * n;
+#ifdef FPLUS_PROFILE
+            double _t0 = wall_time();
+#endif
+            int64_t n_nonpiv = 0, top = n;
+            for (int64_t q = np_off[ci]; q < np_off[ci + 1]; q++) { int64_t i = np.a[q]; W->nonpiv[n_nonpiv++] = i; W->wrow[i] = stamp2; }
+            const int64_t n_np0 = n_nonpiv;
+            for (int64_t q = 0; q < n_np0; q++) {
+                int64_t i = W->nonpiv[q], k = pinv[i];
+                if (k < 0) continue;                        /* still non-pivotal */
+                int64_t sn = col_sn[k];
+                if (W->wsn[sn] == stamp2) { if (k < W->segfirst[sn]) W->segfirst[sn] = k; continue; }
+                top = sn_dfs(sn, k, top, W, stamp2, open, &n_nonpiv);
+            }
+#ifdef FPLUS_PROFILE
+            double _t1 = wall_time(); SNP.t[0] += _t1 - _t0;
+#endif
+            for (int64_t t = top; t < n; t++) {
+                Supernode *S = &W->sn[W->xi[t]];
+                const int64_t r1 = S->nrows, w = S->ncols, kf = W->segfirst[W->xi[t]] - S->first;
+                const T *B = (const T *)S->blk;
+                const int64_t *rows = S->rows;
+                int64_t nrest = r1 - w, m = w - kf;
+                const int64_t *rest = rows + w;
+                if (m * nrest >= SN_BLAS_MIN) {
+                    T *xs = y + nrest;
+                    for (int64_t cc = kf; cc < w; cc++) xs[cc - kf] = x[rows[cc]];
+                    cblas_ztrsv(102, 122, 111, 132, (int)m, B + kf * r1 + kf, (int)r1, xs, 1);
+                    cblas_zgemv(102, 111, (int)nrest, (int)m, &ONE, B + kf * r1 + w, (int)r1, xs, 1, &ZERO, y, 1);
+                    for (int64_t cc = kf; cc < w; cc++) x[rows[cc]] = xs[cc - kf];
+                } else {
+                    for (int64_t r = 0; r < nrest; r++) y[r] = 0;
+                    for (int64_t cc = kf; cc < w; cc++) {
+                        T xc = x[rows[cc]];
+                        if (xc == 0) continue;
+                        const T *Bc = B + cc * r1;
+                        for (int64_t rr = cc + 1; rr < w; rr++) x[rows[rr]] -= xc * Bc[rr];
+                        const T *Br = Bc + w;
+                        for (int64_t r = 0; r < nrest; r++) y[r] += Br[r] * xc;
+                    }
+                }
+                for (int64_t r = 0; r < nrest; r++) x[rest[r]] -= y[r];
+#ifdef FPLUS_PROFILE
+                SNP.fl_loop += 8.0 * ((double)m * (m - 1) / 2 + (double)m * nrest); SNP.n_upd++;
+#endif
+            }
+#ifdef FPLUS_PROFILE
+            double _t2 = wall_time(); SNP.t[3] += _t2 - _t1;
+#endif
+            /* the rows written: clear list = every pattern row (pivotal or not) */
+            const int64_t n_all = n_nonpiv;
+            /* pivot among the rows not yet pivotal */
+            int64_t pivrow = -1; double best = -1.0;
+            for (int64_t q = 0; q < n_all; q++) {
+                int64_t i = W->nonpiv[q];
+                if (pinv[i] >= 0) continue;
+                double a = cabs(x[i]);
+                if (a > best) { best = a; pivrow = i; }
+            }
+            double pivot_threshold = sqrt(2.2204460492503131e-16) * colmax[ci];
+            if (pivrow < 0 || best <= 0.0 || best < pivot_threshold) {
+                char _msg[256];
+                snprintf(_msg, sizeof(_msg), "Near-zero or zero pivot %.6e at step %ld (threshold %.6e). Matrix is singular.",
+                         best > 0 ? best : 0.0, (long)j, pivot_threshold);
+                PyErr_SetString(PyExc_RuntimeError, _msg);
+                rc = -2; goto out;
+            }
+            T piv = x[pivrow];
+            /* U[:, j]: the pre-panel segments (ending at the panel-start width), the within-panel segments, the diagonal */
+            {
+                int64_t need = 1;
+                for (int64_t q = ext_off[ci]; q < ext_off[ci + 1]; q++) {
+                    int64_t sn = ext_s.a[q]; Supernode *S = &W->sn[sn];
+                    int64_t we = (sn == open0) ? we_open : S->ncols;
+                    need += S->first + we - ext_kf.a[q];
+                }
+                for (int64_t t = top; t < n; t++) need += W->sn[W->xi[t]].first + W->sn[W->xi[t]].ncols - W->segfirst[W->xi[t]];
+                if (gp_grow(&W->Ui, &W->Ux, &W->capU, W->nnzU + need, is_complex)) goto out;
+                int64_t *Ui = W->Ui; T *Ux = (T *)W->Ux;
+                int64_t u = W->nnzU;
+                for (int64_t q = ext_off[ci]; q < ext_off[ci + 1]; q++) {
+                    int64_t sn = ext_s.a[q]; Supernode *S = &W->sn[sn];
+                    int64_t we = (sn == open0) ? we_open : S->ncols;
+                    for (int64_t cc = ext_kf.a[q] - S->first; cc < we; cc++) { Ui[u] = S->first + cc; Ux[u] = x[S->rows[cc]]; u++; }
+                }
+                for (int64_t t = top; t < n; t++) {
+                    Supernode *S = &W->sn[W->xi[t]];
+                    for (int64_t cc = W->segfirst[W->xi[t]] - S->first; cc < S->ncols; cc++) { Ui[u] = S->first + cc; Ux[u] = x[S->rows[cc]]; u++; }
+                }
+                Ui[u] = j; Ux[u] = piv; u++;
+                W->nnzU = u; W->Up[j + 1] = u;
+            }
+            /* the non-pivotal rows only, for the L logic */
+            int64_t n_nonpiv_l = 0;
+            for (int64_t q = 0; q < n_all; q++) { int64_t i = W->nonpiv[q]; if (pinv[i] < 0) W->miss[n_nonpiv_l++] = i; }
+            /* (W->miss doubles as the list of non-pivotal rows here; the relaxed join below takes its missing rows from W->nonpiv) */
+            /* L[:, j]: join the open supernode when the pattern nests (or nearly: relaxed), else open one */
+            int join = 0; int64_t n_miss = 0;
+            int64_t *npl = (int64_t *)malloc((size_t)(n_nonpiv_l > 0 ? n_nonpiv_l : 1) * sizeof(int64_t));
+            if (!npl) goto out;
+            memcpy(npl, W->miss, (size_t)n_nonpiv_l * sizeof(int64_t));
+            if (open >= 0) {
+                Supernode *S = &W->sn[open];
+                int64_t in_S = 0;
+                for (int64_t q = 0; q < n_nonpiv_l; q++) {
+                    if (rowpos[npl[q]] >= S->ncols) in_S++;
+                    else W->miss[n_miss++] = npl[q];
+                }
+                int64_t extra = (S->nrows - S->ncols) - in_S;
+                if (n_miss + extra == 0) join = 1;
+                else if (n_miss + extra <= W->relax_rows) join = 2;
+                if (join == 2) {
+                    if (n_miss > 0 && sn_add_rows(S, W->miss, n_miss, rowpos, is_complex)) { free(npl); goto out; }
+                    PROF_RELAX(n_miss * S->ncols + extra);
+                }
+            }
+            if (join) {
+                Supernode *S = &W->sn[open];
+                const int64_t r1 = S->nrows, w = S->ncols;
+                if (sn_grow_cols(S, w + 1, is_complex)) { free(npl); goto out; }
+                T *B = (T *)S->blk;
+                int64_t pp = rowpos[pivrow];
+                if (pp != w) {
+                    int64_t other = S->rows[w];
+                    S->rows[w] = pivrow; S->rows[pp] = other;
+                    rowpos[pivrow] = w; rowpos[other] = pp;
+                    for (int64_t cc = 0; cc < w; cc++) { T tv = B[cc * r1 + w]; B[cc * r1 + w] = B[cc * r1 + pp]; B[cc * r1 + pp] = tv; }
+                }
+                T *Bc = B + w * r1;
+                for (int64_t rr = 0; rr < w; rr++) Bc[rr] = x[S->rows[rr]];
+                Bc[w] = 1;
+                for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;
+                S->ncols = w + 1;
+                col_sn[j] = open;
+            } else {
+                if (open >= 0) {
+                    Supernode *S = &W->sn[open];
+                    int64_t nrest = S->nrows - S->ncols;
+                    S->dfs_rows = (int64_t *)malloc((size_t)(nrest > 0 ? nrest : 1) * sizeof(int64_t));
+                    if (!S->dfs_rows) { free(npl); goto out; }
+                    memcpy(S->dfs_rows, S->rows + S->ncols, (size_t)nrest * sizeof(int64_t));
+                    for (int64_t rr = 0; rr < S->nrows; rr++) rowpos[S->rows[rr]] = -1;
+                }
+                int64_t sn = W->nsn++;
+                Supernode *S = &W->sn[sn];
+                S->first = j; S->ncols = 1; S->nrows = n_nonpiv_l; S->cap = 4;
+                S->dfs_rows = NULL; S->dfs_end = -1;
+                S->rows = (int64_t *)malloc((size_t)S->nrows * sizeof(int64_t));
+                S->blk = malloc((size_t)S->cap * (size_t)S->nrows * sizeof(T));
+                if (!S->rows || !S->blk) { free(npl); goto out; }
+                T *B = (T *)S->blk;
+                S->rows[0] = pivrow; rowpos[pivrow] = 0; B[0] = 1;
+                int64_t rr = 1;
+                for (int64_t t = 0; t < n_nonpiv_l; t++) {
+                    int64_t i = npl[t];
+                    if (i == pivrow) continue;
+                    S->rows[rr] = i; rowpos[i] = rr; B[rr] = x[i] / piv; rr++;
+                }
+                col_sn[j] = sn;
+                open = sn;
+            }
+            free(npl);
+            pinv[pivrow] = j; p[j] = pivrow;
+            /* clear the accumulator: every pattern row and every segment row */
+            for (int64_t q = 0; q < n_all; q++) x[W->nonpiv[q]] = 0;
+            for (int64_t q = ext_off[ci]; q < ext_off[ci + 1]; q++) {
+                int64_t sn = ext_s.a[q]; Supernode *S = &W->sn[sn];
+                int64_t we = (sn == open0) ? we_open : S->ncols;
+                for (int64_t cc = ext_kf.a[q] - S->first; cc < we; cc++) x[S->rows[cc]] = 0;
+            }
+            for (int64_t t = top; t < n; t++) {
+                Supernode *S = &W->sn[W->xi[t]];
+                for (int64_t cc = W->segfirst[W->xi[t]] - S->first; cc < S->ncols; cc++) x[S->rows[cc]] = 0;
+            }
+            x[pivrow] = 0;
+            /* prune the closed supernodes whose segments this column reached (pre-panel and within-panel) */
+            for (int pass = 0; pass < 2; pass++) {
+                int64_t qa = pass == 0 ? ext_off[ci] : top, qb = pass == 0 ? ext_off[ci + 1] : n;
+                for (int64_t q = qa; q < qb; q++) {
+                    int64_t sn = pass == 0 ? ext_s.a[q] : W->xi[q];
+                    Supernode *S = &W->sn[sn];
+                    if (sn == open || S->dfs_end >= 0 || !S->dfs_rows) continue;
+                    int64_t nrest = S->nrows - S->ncols;
+                    int64_t *rows = S->dfs_rows;
+                    int found = 0;
+                    for (int64_t r = 0; r < nrest; r++) if (rows[r] == pivrow) { found = 1; break; }
+                    if (!found) continue;
+                    int64_t ph = 0, pt = nrest;
+                    while (ph < pt) {
+                        if (pinv[rows[ph]] >= 0) { ph++; continue; }
+                        pt--;
+                        int64_t ti = rows[ph]; rows[ph] = rows[pt]; rows[pt] = ti;
+                    }
+                    S->dfs_end = pt;
+                }
+            }
+#ifdef FPLUS_PROFILE
+            SNP.t[4] += wall_time() - _t2;
+#endif
+        }
+        if (verbose >= 2 && ((j0 / P) % (n / (20 * P) + 1) == 0))
+            printf("[FPLUS]   [%5.1f%%] column %ld/%ld  supernodes=%ld (panel %ld)\n", 100.0 * (double)j1 / (double)n, (long)j1, (long)n, (long)W->nsn, (long)P);
+    }
+    rc = 0;
+out:
+    free(X); free(colmax); free(ext_off); free(np_off); free(uidx); free(ustamp);
+    free(ext_s.a); free(ext_kf.a); free(np.a); free(un.a); free(ucnt.a); free(ucol.a); free(ukf.a); free(XS); free(YB);
+    return rc;
+}
+#endif
+
 static PyObject *
 run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax,
-                     int is_complex, int verbose)
+                     int is_complex, int verbose, int64_t relax_rows, int64_t panel)
 {
     double t_start = wall_time();
     size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
@@ -2542,6 +2979,8 @@ run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void
     W.segfirst = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.xi = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.nonpiv = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    W.miss = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    W.relax_rows = relax_rows > 0 ? relax_rows : 0;
     W.pstack = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.head = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.capU = 4 * nnzA + n + 16;
@@ -2554,20 +2993,55 @@ run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void
     int64_t *Lp = NULL, *Li = NULL, *q = NULL;
     void *Lx = NULL;
     if (!W.sn || !W.col_sn || !W.pinv || !W.p || !W.rowpos || !W.wrow || !W.wsn || !W.segfirst
-            || !W.xi || !W.nonpiv || !W.pstack || !W.head || !W.Up || !W.Ui || !W.Ux || !W.x || !W.y) {
+            || !W.xi || !W.nonpiv || !W.miss || !W.pstack || !W.head || !W.Up || !W.Ui || !W.Ux || !W.x || !W.y) {
         PyErr_NoMemory();
         goto done;
     }
     for (int64_t i = 0; i < n; i++) { W.pinv[i] = -1; W.rowpos[i] = -1; }
     W.Up[0] = 0;
     if (verbose >= 1) {
-        printf("[FPLUS] LU factorisation start: n=%ld, nnz(A)=%ld, %s, supernodal left-looking, pivot=partial\n",
-               (long)n, (long)nnzA, is_complex ? "complex128" : "float64");
+        printf("[FPLUS] LU factorisation start: n=%ld, nnz(A)=%ld, %s, supernodal left-looking, pivot=partial, relax_rows=%ld, panel=%ld\n",
+               (long)n, (long)nnzA, is_complex ? "complex128" : "float64", (long)relax_rows, (long)panel);
         fflush(stdout);
     }
-    int rc = is_complex
+#ifdef FPLUS_PROFILE
+    memset(&SNP, 0, sizeof(SNP)); SNP_last = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++) SNP_last[i] = -5;
+#endif
+    const int64_t panel_w = panel > 1 ? panel : 1;
+    int rc;
+#ifdef HAVE_BLAS
+    if (is_complex && panel_w > 1) rc = sn_factor_panel_z(&W, Ap, Ai, (const double complex *)Ax, verbose, panel_w);
+    else
+#endif
+    rc = is_complex
         ? sn_factor_z(&W, Ap, Ai, (const double complex *)Ax, verbose)
         : sn_factor_d(&W, Ap, Ai, (const double *)Ax, verbose);
+#ifdef FPLUS_PROFILE
+    if (rc == 0) {
+        double tt = 0; for (int k = 0; k < NPH; k++) tt += SNP.t[k];
+        printf("[PROF] phases (s, share of %.1f s):\n", tt);
+        for (int k = 0; k < NPH; k++) printf("[PROF]   %-22s %9.2f  %5.1f%%\n", PH_NAME[k], SNP.t[k], 100 * SNP.t[k] / tt);
+        printf("[PROF] updates %ld (BLAS path %ld); flops BLAS %.3e loop %.3e; GF/s BLAS %.2f loop %.2f; GB/s BLAS %.2f loop %.2f\n",
+               (long)SNP.n_upd, (long)SNP.n_upd_blas, SNP.fl_blas, SNP.fl_loop, SNP.fl_blas / SNP.t[2] / 1e9, SNP.fl_loop / SNP.t[3] / 1e9,
+               SNP.by_blas / SNP.t[2] / 1e9, SNP.by_loop / SNP.t[3] / 1e9);
+        double ft = SNP.fl_blas + SNP.fl_loop;
+        printf("[PROF] panel reuse: %.1f%% of update flops come from a supernode that also updated the previous column\n", 100 * SNP.fl_reuse / ft);
+        printf("[PROF] update flops by updating-supernode width (2^k):\n");
+        for (int k = 0; k < 24; k++) if (SNP.fl_w[k] > 0) printf("[PROF]   w %8ld-%-8ld %5.1f%%\n", 1L << k, (2L << k) - 1, 100 * SNP.fl_w[k] / ft);
+        /* final supernode widths */
+        int64_t cw[24] = {0}, cc[24] = {0}; double nl[24] = {0}, nlt = 0;
+        for (int64_t s = 0; s < W.nsn; s++) { Supernode *S = &W.sn[s]; int b = ilog2_i64(S->ncols); cw[b]++; cc[b] += S->ncols;
+            double z = (double)S->ncols * S->nrows - (double)S->ncols * (S->ncols - 1) / 2; nl[b] += z; nlt += z; }
+        printf("[PROF] supernodes %ld, mean width %.2f; by width (2^k): count, columns, share of nnz(L)\n", (long)W.nsn, (double)n / W.nsn);
+        for (int k = 0; k < 24; k++) if (cw[k]) printf("[PROF]   w %8ld-%-8ld %9ld %9ld %5.1f%%\n", 1L << k, (2L << k) - 1, (long)cw[k], (long)cc[k], 100 * nl[k] / nlt);
+        printf("[PROF] relaxed joins %ld (relax_rows %ld), explicit zeros added %.3e\n", (long)SNP.n_relax, (long)W.relax_rows, SNP.zeros);
+        printf("[PROF] non-joins by pattern mismatch (missing + extra rows, bucket 2^k of d+1):\n");
+        for (int k = 0; k < 24; k++) if (SNP.mm[k]) printf("[PROF]   d %8ld-%-8ld %9ld\n", (1L << k) - 1, (2L << k) - 2, (long)SNP.mm[k]);
+        fflush(stdout);
+    }
+    free(SNP_last);
+#endif
     if (rc == -1) { PyErr_NoMemory(); goto done; }
     if (rc != 0) goto done;
 
@@ -2638,7 +3112,7 @@ done:
     if (W.sn)
         for (int64_t s = 0; s < W.nsn; s++) { free(W.sn[s].rows); free(W.sn[s].blk); free(W.sn[s].dfs_rows); }
     free(W.sn); free(W.col_sn); free(W.pinv); free(W.p); free(W.rowpos); free(W.wrow); free(W.wsn);
-    free(W.segfirst); free(W.xi); free(W.nonpiv); free(W.pstack); free(W.head);
+    free(W.segfirst); free(W.xi); free(W.nonpiv); free(W.miss); free(W.pstack); free(W.head);
     free(W.Up); free(W.Ui); free(W.Ux); free(W.x); free(W.y);
     free(Lp); free(Li); free(Lx); free(q);
     return result;
@@ -2651,8 +3125,9 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     PyObject *data_obj, *indices_obj, *indptr_obj;
     Py_ssize_t n_sst;
     int is_complex, verbose = 0;
-    if (!PyArg_ParseTuple(args, "OOOni|i", &data_obj, &indices_obj, &indptr_obj,
-                          &n_sst, &is_complex, &verbose))
+    long long relax_rows = 0, panel = 1;
+    if (!PyArg_ParseTuple(args, "OOOni|iLL", &data_obj, &indices_obj, &indptr_obj,
+                          &n_sst, &is_complex, &verbose, &relax_rows, &panel))
         return NULL;
     int64_t n = (int64_t)n_sst;
     int data_type = is_complex ? NPY_COMPLEX128 : NPY_FLOAT64;
@@ -2666,7 +3141,7 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     }
     PyObject *result = run_factorisation_sn(
         n, (const int64_t *)PyArray_DATA(ptr_arr), (const int64_t *)PyArray_DATA(idx_arr),
-        PyArray_DATA(data_arr), is_complex, verbose);
+        PyArray_DATA(data_arr), is_complex, verbose, (int64_t)relax_rows, (int64_t)panel);
     Py_DECREF(data_arr); Py_DECREF(idx_arr); Py_DECREF(ptr_arr);
     return result;
 }
