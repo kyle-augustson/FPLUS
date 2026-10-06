@@ -2602,6 +2602,59 @@ SN_FACTOR_BODY(sn_factor_d, double, fabs, (void), (void))
 #endif
 
 
+
+#ifdef HAVE_BLAS
+/* -------------------------------------------------------------------------
+ * Optional GPU path for the panel updates (cuBLAS loaded at run time with
+ * dlopen; nothing CUDA at build time).  Only on devices that read pageable
+ * host memory directly (cudaDevAttrPageableMemoryAccess, e.g. coherent
+ * CPU-GPU memory over NVLink-C2C): the zgemm of a panel update runs on the GPU on the host-
+ * resident supernode block and work buffers, the small ztrsm stays on the
+ * CPU.  Library names: FPLUS_CUBLAS_LIB / FPLUS_CUDART_LIB, else
+ * libcublas.so.13 / libcudart.so.13, then .so.12.
+ * ------------------------------------------------------------------------- */
+#include <dlfcn.h>
+typedef int (*cublasCreate_t)(void **);
+typedef int (*cublasZgemm_t)(void *, int, int, int, int, int, const void *, const void *, int, const void *, int,
+                             const void *, void *, int);
+typedef int (*cudaSync_t)(void);
+typedef int (*cudaAttr_t)(int *, int, int);
+typedef struct {
+    int ok; void *handle; cublasZgemm_t zgemm; cudaSync_t sync;
+    double min_flops, t, flops; int64_t calls;
+} GpuCtx;
+
+static void *dlopen_first(const char *env, const char *a, const char *b)
+{
+    const char *e = getenv(env); void *h = NULL;
+    if (e) h = dlopen(e, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) h = dlopen(a, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) h = dlopen(b, RTLD_NOW | RTLD_GLOBAL);
+    return h;
+}
+
+static void gpu_init(GpuCtx *G, double min_flops, int verbose)
+{
+    memset(G, 0, sizeof(*G)); G->min_flops = min_flops;
+    void *rt = dlopen_first("FPLUS_CUDART_LIB", "libcudart.so.13", "libcudart.so.12");
+    void *cb = dlopen_first("FPLUS_CUBLAS_LIB", "libcublas.so.13", "libcublas.so.12");
+    if (!rt || !cb) { if (verbose >= 1) printf("[FPLUS] gpu: CUDA runtime / cuBLAS not found (%s); CPU only\n", dlerror()); return; }
+    cudaAttr_t attr = (cudaAttr_t)dlsym(rt, "cudaDeviceGetAttribute");
+    G->sync = (cudaSync_t)dlsym(rt, "cudaDeviceSynchronize");
+    cublasCreate_t create = (cublasCreate_t)dlsym(cb, "cublasCreate_v2");
+    G->zgemm = (cublasZgemm_t)dlsym(cb, "cublasZgemm_v2");
+    if (!attr || !G->sync || !create || !G->zgemm) { if (verbose >= 1) printf("[FPLUS] gpu: symbols missing; CPU only\n"); return; }
+    int pageable = 0;
+    if (attr(&pageable, 88 /* cudaDevAttrPageableMemoryAccess */, 0) != 0 || !pageable) {
+        if (verbose >= 1) printf("[FPLUS] gpu: device 0 cannot read pageable host memory; CPU only\n");
+        return;
+    }
+    if (create(&G->handle) != 0) { if (verbose >= 1) printf("[FPLUS] gpu: cublasCreate failed; CPU only\n"); return; }
+    G->ok = 1;
+    if (verbose >= 1) printf("[FPLUS] gpu: cuBLAS zgemm for panel updates above %.2e flops (pageable host memory)\n", min_flops);
+}
+#endif
+
 #ifdef HAVE_BLAS
 /* growable int64 array */
 typedef struct { int64_t *a; int64_t n, cap; } I64V;
@@ -2634,7 +2687,7 @@ static int i64v_push(I64V *v, int64_t x)
  * (2) and its columns >= j0 in (3) (a block split of its triangular solve).
  * ------------------------------------------------------------------------- */
 static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, const double complex *Ax,
-                             int verbose, int64_t P)
+                             int verbose, int64_t P, GpuCtx *G)
 {
     typedef double complex T;
     const int64_t n = W->n;
@@ -2733,8 +2786,16 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                     for (int64_t cc = 0; cc < m; cc++) xs[cc] = x[rows[kfa + cc]];
                 }
                 cblas_ztrsm(102, 141, 122, 111, 132, (int)m, (int)pc, &ONE, B + kfa * ld + kfa, (int)ld, XS, (int)m);
-                if (nrest > 0)
-                    cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
+                if (nrest > 0) {
+                    const double gfl = 8.0 * (double)nrest * (double)pc * (double)m;
+                    if (G && G->ok && gfl >= G->min_flops) {
+                        double tg = wall_time();
+                        int st = G->zgemm(G->handle, 0, 0, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
+                        if (st != 0 || G->sync() != 0) { PyErr_Format(PyExc_RuntimeError, "cuBLAS zgemm failed (status %d)", st); rc = -2; goto out; }
+                        G->t += wall_time() - tg; G->flops += gfl; G->calls++;
+                    } else
+                        cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
+                }
                 for (int64_t q = c0; q < c1; q++) {
                     T *x = X + (size_t)ucol.a[q] * n; const T *xs = XS + (q - c0) * m, *yb = YB + (q - c0) * nrest;
                     for (int64_t cc = 0; cc < m; cc++) x[rows[kfa + cc]] = xs[cc];
@@ -2966,7 +3027,7 @@ out:
 
 static PyObject *
 run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax,
-                     int is_complex, int verbose, int64_t relax_rows, int64_t panel)
+                     int is_complex, int verbose, int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops)
 {
     double t_start = wall_time();
     size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
@@ -3016,7 +3077,14 @@ run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void
     const int64_t panel_w = panel > 1 ? panel : 1;
     int rc;
 #ifdef HAVE_BLAS
-    if (is_complex && panel_w > 1) rc = sn_factor_panel_z(&W, Ap, Ai, (const double complex *)Ax, verbose, panel_w);
+    GpuCtx G; memset(&G, 0, sizeof(G));
+    if (use_gpu && is_complex && panel_w > 1) gpu_init(&G, gpu_min_flops, verbose);
+    if (is_complex && panel_w > 1) {
+        rc = sn_factor_panel_z(&W, Ap, Ai, (const double complex *)Ax, verbose, panel_w, G.ok ? &G : NULL);
+        if (G.ok && verbose >= 1)
+            printf("[FPLUS] gpu: %ld zgemm calls, %.3e flops, %.2f s (%.1f GF/s including synchronization)\n",
+                   (long)G.calls, G.flops, G.t, G.t > 0 ? G.flops / G.t / 1e9 : 0.0);
+    }
     else
 #endif
     rc = is_complex
@@ -3131,8 +3199,9 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     Py_ssize_t n_sst;
     int is_complex, verbose = 0;
     long long relax_rows = 0, panel = 1;
-    if (!PyArg_ParseTuple(args, "OOOni|iLL", &data_obj, &indices_obj, &indptr_obj,
-                          &n_sst, &is_complex, &verbose, &relax_rows, &panel))
+    int use_gpu = 0; double gpu_min_flops = 5e7;
+    if (!PyArg_ParseTuple(args, "OOOni|iLLid", &data_obj, &indices_obj, &indptr_obj,
+                          &n_sst, &is_complex, &verbose, &relax_rows, &panel, &use_gpu, &gpu_min_flops))
         return NULL;
     int64_t n = (int64_t)n_sst;
     int data_type = is_complex ? NPY_COMPLEX128 : NPY_FLOAT64;
@@ -3146,7 +3215,7 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     }
     PyObject *result = run_factorisation_sn(
         n, (const int64_t *)PyArray_DATA(ptr_arr), (const int64_t *)PyArray_DATA(idx_arr),
-        PyArray_DATA(data_arr), is_complex, verbose, (int64_t)relax_rows, (int64_t)panel);
+        PyArray_DATA(data_arr), is_complex, verbose, (int64_t)relax_rows, (int64_t)panel, use_gpu, gpu_min_flops);
     Py_DECREF(data_arr); Py_DECREF(idx_arr); Py_DECREF(ptr_arr);
     return result;
 }

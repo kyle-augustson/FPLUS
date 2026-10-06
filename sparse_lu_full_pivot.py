@@ -132,6 +132,8 @@ def sparse_lu_full_pivot(
     relax_rows: int = 0,
     panel: int = 1,
     cache_ordering: bool = True,
+    gpu: bool = False,
+    gpu_min_flops: float = 5e7,
     _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
@@ -239,6 +241,13 @@ def sparse_lu_full_pivot(
         (mean supernode width 1.9 -> 26 at n = 100k) for ~6 percent more
         fill.
 
+    gpu : bool, optional
+        panel > 1, complex, BLAS build: run the zgemm of each panel update
+        whose flop count is at least gpu_min_flops (default 5e7) on the GPU
+        through cuBLAS, loaded at run time, on the host-resident blocks.
+        Needs a device that reads pageable host memory (coherent CPU-GPU memory, e.g. NVLink-C2C); otherwise,
+        or when CUDA is absent, the CPU path runs.  Default False.
+
     cache_ordering : bool, optional
         Reuse the COLAMD ordering of an earlier call with the same sparsity
         pattern and pinning parameters (an LRU of 8; the ordering depends
@@ -341,7 +350,7 @@ def sparse_lu_full_pivot(
     if _HAVE_C_EXT:
         L, U, p_lu, q_lu, Dr, Dc = _lu_factor_c(
             A_work, n, drop_tol, equilibrate, is_complex, dtype,
-            verbose, pivot_code, _return_csc, relax_rows, panel)
+            verbose, pivot_code, _return_csc, relax_rows, panel, gpu, gpu_min_flops)
     else:
         if pivot_strategy != "full":
             import warnings
@@ -1011,7 +1020,7 @@ def _ruiz_c(A_csr, n, is_complex, target_dtype, verbose=0):
 
 
 def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
-                 verbose=0, pivot_code=_PIVOT_PARTIAL, return_csc=False, relax_rows=0, panel=1):
+                 verbose=0, pivot_code=_PIVOT_PARTIAL, return_csc=False, relax_rows=0, panel=1, gpu=False, gpu_min_flops=5e7):
     target_dtype = np.complex128 if is_complex else np.float64
     A_csr = A.astype(target_dtype).tocsr()
     A_csr.sort_indices()
@@ -1033,7 +1042,7 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
             np.ascontiguousarray(A_csc.data, dtype=target_dtype),
             A_csc.indices.astype(np.int64, copy=False),
             A_csc.indptr.astype(np.int64, copy=False),
-            n, int(is_complex), int(verbose), int(relax_rows), int(panel))
+            n, int(is_complex), int(verbose), int(relax_rows), int(panel), int(bool(gpu)), float(gpu_min_flops))
         # the kernel returns CSC; SparseLU keeps it (return_csc), the public function returns CSR
         fmt = csc_matrix if return_csc else (lambda *a, **k: csc_matrix(*a, **k).tocsr())   # noqa: E731
     else:
