@@ -58,6 +58,7 @@ from .sparse_lu_full_pivot import (
     sparse_lu_full_pivot,
     lu_solve,
     lu_residual,
+    clear_ordering_cache,
     _HAVE_C_EXT,
 )
 
@@ -66,5 +67,6 @@ __all__ = [
     "sparse_lu_full_pivot",
     "lu_solve",
     "lu_residual",
+    "clear_ordering_cache",
     "_HAVE_C_EXT",
 ]

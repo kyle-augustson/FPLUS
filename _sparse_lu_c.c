@@ -2222,6 +2222,7 @@ typedef struct {
     int64_t first;      /* first column */
     int64_t ncols;      /* columns stored so far */
     int64_t nrows;      /* rows of the block: ncols pivot rows, then the rest */
+    int64_t ld;         /* leading dimension of blk and capacity of rows (>= nrows; relaxed joins append rows in place) */
     int64_t cap;        /* column capacity of the block */
     int64_t *rows;      /* original row index per block row */
     void *blk;          /* dense column-major nrows x ncols */
@@ -2313,18 +2314,22 @@ static int sn_add_rows(Supernode *S, const int64_t *rows_new, int64_t k, int64_t
 {
     const size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
     const int64_t r1 = S->nrows, nr = r1 + k;
-    int64_t *nrw = (int64_t *)realloc(S->rows, (size_t)nr * sizeof(int64_t));
-    if (!nrw) return -1;
-    S->rows = nrw;
-    char *nb = (char *)malloc((size_t)S->cap * (size_t)nr * vs);
-    if (!nb) return -1;
-    const char *ob = (const char *)S->blk;
-    for (int64_t c = 0; c < S->ncols; c++) {
-        memcpy(nb + (size_t)c * nr * vs, ob + (size_t)c * r1 * vs, (size_t)r1 * vs);
-        memset(nb + ((size_t)c * nr + r1) * vs, 0, (size_t)k * vs);
+    if (nr > S->ld) {
+        /* grow the leading dimension geometrically: amortized O(1) copies per added row */
+        const int64_t nld = nr + nr / 4 + 4;
+        int64_t *nrw = (int64_t *)realloc(S->rows, (size_t)nld * sizeof(int64_t));
+        if (!nrw) return -1;
+        S->rows = nrw;
+        char *nb = (char *)malloc((size_t)S->cap * (size_t)nld * vs);
+        if (!nb) return -1;
+        const char *ob = (const char *)S->blk;
+        for (int64_t c = 0; c < S->ncols; c++)
+            memcpy(nb + (size_t)c * nld * vs, ob + (size_t)c * S->ld * vs, (size_t)r1 * vs);
+        free(S->blk); S->blk = nb; S->ld = nld;
     }
-    free(S->blk); S->blk = nb;
-    for (int64_t i = 0; i < k; i++) { nrw[r1 + i] = rows_new[i]; rowpos[rows_new[i]] = r1 + i; }
+    char *b = (char *)S->blk;
+    for (int64_t c = 0; c < S->ncols; c++) memset(b + ((size_t)c * S->ld + r1) * vs, 0, (size_t)k * vs);
+    for (int64_t i = 0; i < k; i++) { S->rows[r1 + i] = rows_new[i]; rowpos[rows_new[i]] = r1 + i; }
     S->nrows = nr;
     return 0;
 }
@@ -2334,7 +2339,7 @@ static int sn_grow_cols(Supernode *S, int64_t need, int is_complex)
     if (need <= S->cap) return 0;
     int64_t ncap = S->cap * 2 > need ? S->cap * 2 : need;
     size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
-    void *nb = realloc(S->blk, (size_t)ncap * (size_t)S->nrows * vs);
+    void *nb = realloc(S->blk, (size_t)ncap * (size_t)S->ld * vs);
     if (!nb) return -1;
     S->blk = nb;
     S->cap = ncap;
@@ -2414,7 +2419,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
         for (int64_t t = top; t < n; t++) {                                             \
             PROF_UPD_BEGIN();                                                           \
             Supernode *S = &W->sn[xi[t]];                                               \
-            const int64_t r1 = S->nrows, w = S->ncols, kf = W->segfirst[xi[t]] - S->first; \
+            const int64_t r1 = S->nrows, ld = S->ld, w = S->ncols, kf = W->segfirst[xi[t]] - S->first; \
             const T *B = (const T *)S->blk;                                             \
             const int64_t *rows = S->rows;                                              \
             int64_t nrest = r1 - w, m = w - kf;                                         \
@@ -2423,15 +2428,15 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
                 /* x_seg = L_seg^-1 x_seg, then y = B_rest x_seg, with BLAS */          \
                 T *xs = y + nrest;                                                      \
                 for (int64_t cc = kf; cc < w; cc++) xs[cc - kf] = x[rows[cc]];          \
-                TRSV(102, 122, 111, 132, (int)m, B + kf * r1 + kf, (int)r1, xs, 1);     \
-                GEMV(102, 111, (int)nrest, (int)m, &ONE, B + kf * r1 + w, (int)r1, xs, 1, &ZERO, y, 1); \
+                TRSV(102, 122, 111, 132, (int)m, B + kf * ld + kf, (int)ld, xs, 1);     \
+                GEMV(102, 111, (int)nrest, (int)m, &ONE, B + kf * ld + w, (int)ld, xs, 1, &ZERO, y, 1); \
                 for (int64_t cc = kf; cc < w; cc++) x[rows[cc]] = xs[cc - kf];          \
             } else {                                                                    \
                 for (int64_t r = 0; r < nrest; r++) y[r] = 0;                           \
                 for (int64_t cc = kf; cc < w; cc++) {                                   \
                     T xc = x[rows[cc]];                                                 \
                     if (xc == 0) continue;                                              \
-                    const T *Bc = B + cc * r1;                                          \
+                    const T *Bc = B + cc * ld;                                          \
                     for (int64_t rr = cc + 1; rr < w; rr++) x[rows[rr]] -= xc * Bc[rr]; \
                     const T *Br = Bc + w;                                               \
                     for (int64_t r = 0; r < nrest; r++) y[r] += Br[r] * xc;             \
@@ -2496,7 +2501,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
         }                                                                               \
         if (join) {                                                                     \
             Supernode *S = &W->sn[open];                                                \
-            const int64_t r1 = S->nrows, w = S->ncols;                                  \
+            const int64_t r1 = S->nrows, ld = S->ld, w = S->ncols;                      \
             if (sn_grow_cols(S, w + 1, is_complex)) return -1;                          \
             T *B = (T *)S->blk;                                                         \
             /* the pivot row moves to block row w */                                    \
@@ -2506,10 +2511,10 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
                 S->rows[w] = pivrow; S->rows[pp] = other;                               \
                 rowpos[pivrow] = w; rowpos[other] = pp;                                 \
                 for (int64_t cc = 0; cc < w; cc++) {                                    \
-                    T tv = B[cc * r1 + w]; B[cc * r1 + w] = B[cc * r1 + pp]; B[cc * r1 + pp] = tv; \
+                    T tv = B[cc * ld + w]; B[cc * ld + w] = B[cc * ld + pp]; B[cc * ld + pp] = tv; \
                 }                                                                       \
             }                                                                           \
-            T *Bc = B + w * r1;                                                         \
+            T *Bc = B + w * ld;                                                         \
             for (int64_t rr = 0; rr < w; rr++) Bc[rr] = x[S->rows[rr]];                 \
             Bc[w] = 1;                                                                  \
             for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;      \
@@ -2529,10 +2534,10 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             }                                                                           \
             int64_t s = W->nsn++;                                                       \
             Supernode *S = &W->sn[s];                                                   \
-            S->first = j; S->ncols = 1; S->nrows = n_nonpiv; S->cap = 4;                \
+            S->first = j; S->ncols = 1; S->nrows = n_nonpiv; S->ld = n_nonpiv; S->cap = 4; \
             S->dfs_rows = NULL; S->dfs_end = -1;                                        \
             S->rows = (int64_t *)malloc((size_t)S->nrows * sizeof(int64_t));            \
-            S->blk = malloc((size_t)S->cap * (size_t)S->nrows * (is_complex ? sizeof(double complex) : sizeof(double))); \
+            S->blk = malloc((size_t)S->cap * (size_t)S->ld * (is_complex ? sizeof(double complex) : sizeof(double))); \
             if (!S->rows || !S->blk) return -1;                                         \
             T *B = (T *)S->blk;                                                         \
             S->rows[0] = pivrow; rowpos[pivrow] = 0; B[0] = 1;                          \
@@ -2714,7 +2719,7 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                 const int64_t sn = un.a[u], c0 = ucnt.a[u], c1 = ucnt.a[u + 1], pc = c1 - c0;
                 if (pc == 0) continue;
                 Supernode *S = &W->sn[sn];
-                const int64_t r1 = S->nrows, we = (sn == open0) ? we_open : S->ncols;
+                const int64_t r1 = S->nrows, ld = S->ld, we = (sn == open0) ? we_open : S->ncols;
                 int64_t kfa = we;
                 for (int64_t q = c0; q < c1; q++) { int64_t k = ukf.a[q] - S->first; if (k < kfa) kfa = k; }
                 const int64_t m = we - kfa, nrest = r1 - we;
@@ -2727,9 +2732,9 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                     const T *x = X + (size_t)ucol.a[q] * n; T *xs = XS + (q - c0) * m;
                     for (int64_t cc = 0; cc < m; cc++) xs[cc] = x[rows[kfa + cc]];
                 }
-                cblas_ztrsm(102, 141, 122, 111, 132, (int)m, (int)pc, &ONE, B + kfa * r1 + kfa, (int)r1, XS, (int)m);
+                cblas_ztrsm(102, 141, 122, 111, 132, (int)m, (int)pc, &ONE, B + kfa * ld + kfa, (int)ld, XS, (int)m);
                 if (nrest > 0)
-                    cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * r1 + we, (int)r1, XS, (int)m, &ZERO, YB, (int)nrest);
+                    cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
                 for (int64_t q = c0; q < c1; q++) {
                     T *x = X + (size_t)ucol.a[q] * n; const T *xs = XS + (q - c0) * m, *yb = YB + (q - c0) * nrest;
                     for (int64_t cc = 0; cc < m; cc++) x[rows[kfa + cc]] = xs[cc];
@@ -2767,7 +2772,7 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
 #endif
             for (int64_t t = top; t < n; t++) {
                 Supernode *S = &W->sn[W->xi[t]];
-                const int64_t r1 = S->nrows, w = S->ncols, kf = W->segfirst[W->xi[t]] - S->first;
+                const int64_t r1 = S->nrows, ld = S->ld, w = S->ncols, kf = W->segfirst[W->xi[t]] - S->first;
                 const T *B = (const T *)S->blk;
                 const int64_t *rows = S->rows;
                 int64_t nrest = r1 - w, m = w - kf;
@@ -2775,15 +2780,15 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                 if (m * nrest >= SN_BLAS_MIN) {
                     T *xs = y + nrest;
                     for (int64_t cc = kf; cc < w; cc++) xs[cc - kf] = x[rows[cc]];
-                    cblas_ztrsv(102, 122, 111, 132, (int)m, B + kf * r1 + kf, (int)r1, xs, 1);
-                    cblas_zgemv(102, 111, (int)nrest, (int)m, &ONE, B + kf * r1 + w, (int)r1, xs, 1, &ZERO, y, 1);
+                    cblas_ztrsv(102, 122, 111, 132, (int)m, B + kf * ld + kf, (int)ld, xs, 1);
+                    cblas_zgemv(102, 111, (int)nrest, (int)m, &ONE, B + kf * ld + w, (int)ld, xs, 1, &ZERO, y, 1);
                     for (int64_t cc = kf; cc < w; cc++) x[rows[cc]] = xs[cc - kf];
                 } else {
                     for (int64_t r = 0; r < nrest; r++) y[r] = 0;
                     for (int64_t cc = kf; cc < w; cc++) {
                         T xc = x[rows[cc]];
                         if (xc == 0) continue;
-                        const T *Bc = B + cc * r1;
+                        const T *Bc = B + cc * ld;
                         for (int64_t rr = cc + 1; rr < w; rr++) x[rows[rr]] -= xc * Bc[rr];
                         const T *Br = Bc + w;
                         for (int64_t r = 0; r < nrest; r++) y[r] += Br[r] * xc;
@@ -2866,7 +2871,7 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
             }
             if (join) {
                 Supernode *S = &W->sn[open];
-                const int64_t r1 = S->nrows, w = S->ncols;
+                const int64_t r1 = S->nrows, ld = S->ld, w = S->ncols;
                 if (sn_grow_cols(S, w + 1, is_complex)) { free(npl); goto out; }
                 T *B = (T *)S->blk;
                 int64_t pp = rowpos[pivrow];
@@ -2874,9 +2879,9 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                     int64_t other = S->rows[w];
                     S->rows[w] = pivrow; S->rows[pp] = other;
                     rowpos[pivrow] = w; rowpos[other] = pp;
-                    for (int64_t cc = 0; cc < w; cc++) { T tv = B[cc * r1 + w]; B[cc * r1 + w] = B[cc * r1 + pp]; B[cc * r1 + pp] = tv; }
+                    for (int64_t cc = 0; cc < w; cc++) { T tv = B[cc * ld + w]; B[cc * ld + w] = B[cc * ld + pp]; B[cc * ld + pp] = tv; }
                 }
-                T *Bc = B + w * r1;
+                T *Bc = B + w * ld;
                 for (int64_t rr = 0; rr < w; rr++) Bc[rr] = x[S->rows[rr]];
                 Bc[w] = 1;
                 for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;
@@ -2893,10 +2898,10 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                 }
                 int64_t sn = W->nsn++;
                 Supernode *S = &W->sn[sn];
-                S->first = j; S->ncols = 1; S->nrows = n_nonpiv_l; S->cap = 4;
+                S->first = j; S->ncols = 1; S->nrows = n_nonpiv_l; S->ld = n_nonpiv_l; S->cap = 4;
                 S->dfs_rows = NULL; S->dfs_end = -1;
                 S->rows = (int64_t *)malloc((size_t)S->nrows * sizeof(int64_t));
-                S->blk = malloc((size_t)S->cap * (size_t)S->nrows * sizeof(T));
+                S->blk = malloc((size_t)S->cap * (size_t)S->ld * sizeof(T));
                 if (!S->rows || !S->blk) { free(npl); goto out; }
                 T *B = (T *)S->blk;
                 S->rows[0] = pivrow; rowpos[pivrow] = 0; B[0] = 1;
@@ -3068,8 +3073,8 @@ run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void
                 o++;
                 for (int64_t rr = cc + 1; rr < S->nrows; rr++) {
                     Li[o] = W.pinv[S->rows[rr]];
-                    if (is_complex) ((double complex *)Lx)[o] = ((double complex *)S->blk)[cc * S->nrows + rr];
-                    else            ((double *)Lx)[o] = ((double *)S->blk)[cc * S->nrows + rr];
+                    if (is_complex) ((double complex *)Lx)[o] = ((double complex *)S->blk)[cc * S->ld + rr];
+                    else            ((double *)Lx)[o] = ((double *)S->blk)[cc * S->ld + rr];
                     o++;
                 }
             }

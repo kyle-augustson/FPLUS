@@ -796,6 +796,20 @@ class TestRelaxPanel:
             be = self._be(sp.csr_matrix(M), x, b)
             assert be < 1e-13, f"trans {tr}: backward error {be:.1e}"
 
+    def test_ordering_cache_is_exact(self):
+        from sparse_lu_full_pivot import clear_ordering_cache
+        A = banded_plus_random_complex(900)
+        b = RNG.standard_normal(900) + 1j * RNG.standard_normal(900)
+        clear_ordering_cache()
+        l1 = SparseLU(A, colamd=True, relax_rows=2, panel=8)
+        l2 = SparseLU(A, colamd=True, relax_rows=2, panel=8)                       # from the cache
+        l3 = SparseLU(A, colamd=True, relax_rows=2, panel=8, cache_ordering=False)
+        assert np.array_equal(l1.perm_c, l2.perm_c) and np.array_equal(l1.perm_c, l3.perm_c)
+        assert np.array_equal(l1.perm_r, l2.perm_r)
+        A2 = (A + 0.3j * speye(900, dtype=np.complex128)).tocsr()                # same pattern, other values (a new shift)
+        x = SparseLU(A2, colamd=True, relax_rows=2, panel=8).solve(b)
+        assert self._be(A2, x, b) < 1e-13
+
     def test_real_matrix_ignores_panel(self):
         A = diag_dom_real(400, density=0.02)
         b = RNG.standard_normal(400)

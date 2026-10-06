@@ -131,6 +131,7 @@ def sparse_lu_full_pivot(
     verbose: int = 0,
     relax_rows: int = 0,
     panel: int = 1,
+    cache_ordering: bool = True,
     _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
@@ -238,6 +239,12 @@ def sparse_lu_full_pivot(
         (mean supernode width 1.9 -> 26 at n = 100k) for ~6 percent more
         fill.
 
+    cache_ordering : bool, optional
+        Reuse the COLAMD ordering of an earlier call with the same sparsity
+        pattern and pinning parameters (an LRU of 8; the ordering depends
+        on nothing else, so this is exact).  Default True;
+        clear_ordering_cache() empties it.
+
     panel : int, optional
         Supernodal partial pivoting, complex matrices, BLAS build only.
         Columns are processed in panels of this width: each supernode
@@ -304,7 +311,7 @@ def sparse_lu_full_pivot(
     if colamd:
         row_perm, col_perm = _colamd_permutations(
             A, n, pin_dense_rows, tau_density, tau_min_nnz,
-            tau_row_mask, tau_col_mask)
+            tau_row_mask, tau_col_mask, cache=cache_ordering)
         if verbose >= 1:
             if pin_dense_rows:
                 A_csr_v = A.tocsr() if not isinstance(A, csr_matrix) else A
@@ -777,7 +784,53 @@ def _colamd_ordering(A_csr: csr_matrix, n: int,
     return _colamd_splu_fallback(A_struct, n)
 
 
-def _colamd_permutations(
+# COLAMD orderings by sparsity pattern: the ordering is a function of the pattern and the pinning parameters
+# only, so a cached one is exact.  Repeated factorizations of one pattern (shift-invert at several shifts, a
+# rebuilt Dedalus pencil) skip COLAMD, which took 19 s of 89 s at n = 100k on a complex test pencil.
+_ORDER_CACHE: "OrderedDict" = None
+_ORDER_CACHE_MAX = 8
+
+
+def clear_ordering_cache():
+    """Forget every cached COLAMD ordering."""
+    global _ORDER_CACHE
+    _ORDER_CACHE = None
+
+
+def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask):
+    import hashlib
+    A_csr = A.tocsr() if not isinstance(A, csr_matrix) else A
+    if not A_csr.has_sorted_indices:
+        A_csr = A_csr.copy(); A_csr.sort_indices()
+    h = hashlib.blake2b(digest_size=20)
+    h.update(np.ascontiguousarray(A_csr.indptr, dtype=np.int64).tobytes())
+    h.update(np.ascontiguousarray(A_csr.indices, dtype=np.int64).tobytes())
+    for m in (tau_row_mask, tau_col_mask):
+        h.update(b"none" if m is None else np.packbits(np.asarray(m, dtype=bool)).tobytes())
+    return (n, A_csr.nnz, bool(pin_dense_rows), float(tau_density), int(tau_min_nnz), h.hexdigest())
+
+
+def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, cache=True):
+    """_colamd_permutations_uncached, cached by sparsity pattern (cache=True)."""
+    global _ORDER_CACHE
+    if not cache:
+        return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask)
+    from collections import OrderedDict
+    if _ORDER_CACHE is None:
+        _ORDER_CACHE = OrderedDict()
+    key = _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask)
+    hit = _ORDER_CACHE.get(key)
+    if hit is None:
+        hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask)
+        _ORDER_CACHE[key] = hit
+        while len(_ORDER_CACHE) > _ORDER_CACHE_MAX:
+            _ORDER_CACHE.popitem(last=False)
+    else:
+        _ORDER_CACHE.move_to_end(key)
+    return hit[0].copy(), hit[1].copy()
+
+
+def _colamd_permutations_uncached(
     A: sp.spmatrix,
     n: int,
     pin_dense_rows: bool,
