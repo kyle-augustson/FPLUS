@@ -142,6 +142,7 @@ def sparse_lu_full_pivot(
     cache_ordering: bool = True,
     gpu: bool = False,
     gpu_min_flops: float = 5e7,
+    pivot_rel: Optional[float] = None,
     _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
@@ -256,6 +257,15 @@ def sparse_lu_full_pivot(
         Needs a device that reads pageable host memory (coherent CPU-GPU memory, e.g. NVLink-C2C); otherwise,
         or when CUDA is absent, the CPU path runs.  Default False.
 
+    pivot_rel : float, optional
+        Relative singular-pivot threshold: the factorization stops with
+        "Matrix is singular" when the best available pivot is below
+        pivot_rel times the column's largest modulus (equilibrated).
+        Default None = sqrt(machine epsilon) ~ 1.5e-8, the LAPACK choice.
+        Shift-invert pencils shifted close to an eigenvalue are nearly
+        singular by design; there a smaller value (e.g. 1e-14) lets the
+        factorization finish, and the backward error decides.
+
     cache_ordering : bool, optional
         Reuse the COLAMD ordering of an earlier call with the same sparsity
         pattern and pinning parameters (an LRU of 8; the ordering depends
@@ -358,7 +368,7 @@ def sparse_lu_full_pivot(
     if _HAVE_C_EXT:
         L, U, p_lu, q_lu, Dr, Dc = _lu_factor_c(
             A_work, n, drop_tol, equilibrate, is_complex, dtype,
-            verbose, pivot_code, _return_csc, relax_rows, panel, gpu, gpu_min_flops)
+            verbose, pivot_code, _return_csc, relax_rows, panel, gpu, gpu_min_flops, pivot_rel)
     else:
         if pivot_strategy != "full":
             import warnings
@@ -1028,7 +1038,9 @@ def _ruiz_c(A_csr, n, is_complex, target_dtype, verbose=0):
 
 
 def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
-                 verbose=0, pivot_code=_PIVOT_PARTIAL, return_csc=False, relax_rows=0, panel=1, gpu=False, gpu_min_flops=5e7):
+                 verbose=0, pivot_code=_PIVOT_PARTIAL, return_csc=False, relax_rows=0, panel=1, gpu=False, gpu_min_flops=5e7,
+                 pivot_rel=None):
+    pivot_rel = float(np.sqrt(np.finfo(np.float64).eps)) if pivot_rel is None else float(pivot_rel)
     target_dtype = np.complex128 if is_complex else np.float64
     A_csr = A.astype(target_dtype).tocsr()
     A_csr.sort_indices()
@@ -1050,13 +1062,13 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
             np.ascontiguousarray(A_csc.data, dtype=target_dtype),
             A_csc.indices.astype(np.int64, copy=False),
             A_csc.indptr.astype(np.int64, copy=False),
-            n, int(is_complex), int(verbose), int(relax_rows), int(panel), int(bool(gpu)), float(gpu_min_flops))
+            n, int(is_complex), int(verbose), int(relax_rows), int(panel), int(bool(gpu)), float(gpu_min_flops), pivot_rel)
         # the kernel returns CSC; SparseLU keeps it (return_csc), the public function returns CSR
         fmt = csc_matrix if return_csc else (lambda *a, **k: csc_matrix(*a, **k).tocsr())   # noqa: E731
     else:
         raw = _sparse_lu_c.lu_factor(
             data, indices, indptr, n, float(drop_tol), int(is_complex),
-            int(verbose), int(pivot_code)
+            int(verbose), int(pivot_code), pivot_rel
         )
         fmt = csr_matrix
 

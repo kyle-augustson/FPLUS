@@ -178,6 +178,9 @@ static inline double wall_time(void)
 /* =========================================================================
  * Per-row dynamic sparse vector
  * ========================================================================= */
+/* default relative singular-pivot threshold: sqrt(DBL_EPSILON), the LAPACK choice */
+#define FPLUS_PIVOT_REL_DEFAULT 1.4901161193847656e-08
+
 typedef struct {
     int64_t        *cols;    /* sorted column indices, heap-allocated */
     double complex *vals_z;  /* complex values  (NULL for real)       */
@@ -1368,7 +1371,7 @@ run_factorisation(int64_t n,
                   const int64_t * restrict in_indices,
                   const void    * restrict in_data,
                   double drop_tol, int is_complex, int verbose,
-                  int pivot_strategy)
+                  int pivot_strategy, double pivot_rel)
 {
     SparseRow *M   = NULL, *Lm  = NULL;
     int64_t   *p   = NULL, *q   = NULL;
@@ -1518,7 +1521,7 @@ run_factorisation(int64_t n,
 
         if (k == 0) {
             max_entry_k0   = best_abs_k;
-            pivot_threshold = sqrt(2.2204460492503131e-16) * max_entry_k0;
+            pivot_threshold = pivot_rel * max_entry_k0;
         }
 
         if (!found || best_abs_k < pivot_threshold) {
@@ -1861,12 +1864,14 @@ py_lu_factor(PyObject *self, PyObject *args)
     int is_complex;
     int verbose = 0;          /* optional, default 0 = silent */
     int pivot_strategy = FPLUS_PIVOT_PARTIAL;  /* optional, default partial */
+    double pivot_rel = FPLUS_PIVOT_REL_DEFAULT; /* optional relative singular-pivot threshold */
 
-    if (!PyArg_ParseTuple(args, "OOOndi|ii",
+    if (!PyArg_ParseTuple(args, "OOOndi|iid",
                           &data_obj, &indices_obj, &indptr_obj,
                           &n_sst, &drop_tol, &is_complex,
-                          &verbose, &pivot_strategy))
+                          &verbose, &pivot_strategy, &pivot_rel))
         return NULL;
+    if (!(pivot_rel >= 0.0)) { PyErr_SetString(PyExc_ValueError, "pivot_rel must be >= 0"); return NULL; }
     int64_t n = (int64_t)n_sst;
 
     /* Validate pivot_strategy. */
@@ -1902,7 +1907,7 @@ py_lu_factor(PyObject *self, PyObject *args)
 
     PyObject *result = run_factorisation(n, indptr, indices, data,
                                          drop_tol, is_complex, verbose,
-                                         pivot_strategy);
+                                         pivot_strategy, pivot_rel);
     Py_DECREF(data_arr); Py_DECREF(idx_arr); Py_DECREF(ptr_arr);
     return result;
 }
@@ -2245,6 +2250,7 @@ typedef struct {
     int64_t *nonpiv;    /* non-pivotal rows of the pattern */
     int64_t *miss;      /* rows of column j missing from the open supernode (relaxed join) */
     int64_t relax_rows; /* relaxed join: at most this many rows of pattern mismatch (0 = exact supernodes) */
+    double pivot_rel;   /* singular when the best pivot < pivot_rel * the column's max (default sqrt(DBL_EPSILON)) */
     int64_t *pstack, *head;
     int64_t *Up, *Ui;  void *Ux;  int64_t nnzU, capU;
     void *x, *y;        /* accumulator and the dense work vector */
@@ -2452,7 +2458,7 @@ static int NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const T *Ax, in
             double a = ABSF(x[nonpiv[s]]);                                              \
             if (a > best) { best = a; pivrow = nonpiv[s]; }                             \
         }                                                                               \
-        pivot_threshold = sqrt(2.2204460492503131e-16) * colmax;                       \
+        pivot_threshold = W->pivot_rel * colmax;                                     \
         if (pivrow < 0 || best <= 0.0 || best < pivot_threshold) {                      \
             char _msg[256];                                                             \
             snprintf(_msg, sizeof(_msg),                                                \
@@ -2882,7 +2888,7 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                 double a = cabs(x[i]);
                 if (a > best) { best = a; pivrow = i; }
             }
-            double pivot_threshold = sqrt(2.2204460492503131e-16) * colmax[ci];
+            double pivot_threshold = W->pivot_rel * colmax[ci];
             if (pivrow < 0 || best <= 0.0 || best < pivot_threshold) {
                 char _msg[256];
                 snprintf(_msg, sizeof(_msg), "Near-zero or zero pivot %.6e at step %ld (threshold %.6e). Matrix is singular.",
@@ -3036,7 +3042,8 @@ out:
 
 static PyObject *
 run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax,
-                     int is_complex, int verbose, int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops)
+                     int is_complex, int verbose, int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops,
+                     double pivot_rel)
 {
     double t_start = wall_time();
     size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
@@ -3056,6 +3063,7 @@ run_factorisation_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void
     W.nonpiv = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.miss = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.relax_rows = relax_rows > 0 ? relax_rows : 0;
+    W.pivot_rel = pivot_rel;
     W.pstack = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.head = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     W.capU = 4 * nnzA + n + 16;
@@ -3208,10 +3216,11 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     Py_ssize_t n_sst;
     int is_complex, verbose = 0;
     long long relax_rows = 0, panel = 1;
-    int use_gpu = 0; double gpu_min_flops = 5e7;
-    if (!PyArg_ParseTuple(args, "OOOni|iLLid", &data_obj, &indices_obj, &indptr_obj,
-                          &n_sst, &is_complex, &verbose, &relax_rows, &panel, &use_gpu, &gpu_min_flops))
+    int use_gpu = 0; double gpu_min_flops = 5e7; double pivot_rel = FPLUS_PIVOT_REL_DEFAULT;
+    if (!PyArg_ParseTuple(args, "OOOni|iLLidd", &data_obj, &indices_obj, &indptr_obj,
+                          &n_sst, &is_complex, &verbose, &relax_rows, &panel, &use_gpu, &gpu_min_flops, &pivot_rel))
         return NULL;
+    if (!(pivot_rel >= 0.0)) { PyErr_SetString(PyExc_ValueError, "pivot_rel must be >= 0"); return NULL; }
     int64_t n = (int64_t)n_sst;
     int data_type = is_complex ? NPY_COMPLEX128 : NPY_FLOAT64;
     PyArrayObject *data_arr = (PyArrayObject *)PyArray_FROM_OTF(data_obj, data_type, NPY_ARRAY_IN_ARRAY);
@@ -3224,7 +3233,7 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     }
     PyObject *result = run_factorisation_sn(
         n, (const int64_t *)PyArray_DATA(ptr_arr), (const int64_t *)PyArray_DATA(idx_arr),
-        PyArray_DATA(data_arr), is_complex, verbose, (int64_t)relax_rows, (int64_t)panel, use_gpu, gpu_min_flops);
+        PyArray_DATA(data_arr), is_complex, verbose, (int64_t)relax_rows, (int64_t)panel, use_gpu, gpu_min_flops, pivot_rel);
     Py_DECREF(data_arr); Py_DECREF(idx_arr); Py_DECREF(ptr_arr);
     return result;
 }
