@@ -1963,6 +1963,101 @@ py_lu_factor(PyObject *self, PyObject *args)
  *
  * The returned "data" array is the scaled CSR data (indices/indptr unchanged).
  * ========================================================================= */
+/* One Ruiz iteration on CSC arrays: the arithmetic of the CSR loop in py_ruiz_equilibrate (row maxima of the squared
+ * moduli, row scaling by 1/sqrt(row max), column maxima of the scaled entries, column scaling), so Dr, Dc and the
+ * scaled data agree bit for bit with the CSR route on the same matrix (maxima do not depend on traversal order and
+ * the scalings are elementwise).  Column-oriented passes run in parallel.  row_max / col_max are workspace.
+ * Returns 0, or 1 + i for an all-zero row i, or -(1 + j) for an all-zero column j. */
+static int64_t ruiz_csc_iter(void *data, const int64_t *indices, const int64_t *indptr, int64_t n, int is_complex,
+                             double *Dr, double *Dc, double *row_max, double *col_max, double *res_out)
+{
+    for (int64_t i = 0; i < n; i++) row_max[i] = 0.0;
+    if (is_complex) {
+        const double complex *zd = (const double complex *)data;
+        for (int64_t j = 0; j < n; j++)
+            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                double re = creal(zd[p]), im = cimag(zd[p]);
+                double av = re * re + im * im;
+                if (av > row_max[indices[p]]) row_max[indices[p]] = av;
+            }
+    } else {
+        const double *dd = (const double *)data;
+        for (int64_t j = 0; j < n; j++)
+            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                double av = dd[p] * dd[p];
+                if (av > row_max[indices[p]]) row_max[indices[p]] = av;
+            }
+    }
+    for (int64_t i = 0; i < n; i++)
+        if (row_max[i] == 0.0) return 1 + i;
+    double res = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        double v = 0.5 * fabs(log(row_max[i]));
+        if (v > res) res = v;
+    }
+    /* row_max becomes the row scale */
+    for (int64_t i = 0; i < n; i++) {
+        double dr = 1.0 / sqrt(sqrt(row_max[i]));
+        Dr[i] *= dr;
+        row_max[i] = dr;
+    }
+    if (is_complex) {
+        double complex *zd = (double complex *)data;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int64_t j = 0; j < n; j++) {
+            double cm = 0.0;
+            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                zd[p] *= row_max[indices[p]];
+                double re = creal(zd[p]), im = cimag(zd[p]);
+                double av = re * re + im * im;
+                if (av > cm) cm = av;
+            }
+            col_max[j] = cm;
+        }
+    } else {
+        double *dd = (double *)data;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int64_t j = 0; j < n; j++) {
+            double cm = 0.0;
+            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                dd[p] *= row_max[indices[p]];
+                double av = dd[p] * dd[p];
+                if (av > cm) cm = av;
+            }
+            col_max[j] = cm;
+        }
+    }
+    for (int64_t j = 0; j < n; j++)
+        if (col_max[j] == 0.0) return -(1 + j);
+    for (int64_t j = 0; j < n; j++) {
+        double v = 0.5 * fabs(log(col_max[j]));
+        if (v > res) res = v;
+        col_max[j] = 1.0 / sqrt(sqrt(col_max[j]));
+        Dc[j] *= col_max[j];
+    }
+    if (is_complex) {
+        double complex *zd = (double complex *)data;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int64_t j = 0; j < n; j++)
+            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) zd[p] *= col_max[j];
+    } else {
+        double *dd = (double *)data;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int64_t j = 0; j < n; j++)
+            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) dd[p] *= col_max[j];
+    }
+    *res_out = res;
+    return 0;
+}
+
 static PyObject *
 py_ruiz_equilibrate(PyObject *self, PyObject *args)
 {
@@ -1972,10 +2067,11 @@ py_ruiz_equilibrate(PyObject *self, PyObject *args)
     int max_iter, is_complex;
     double tol;
     int verbose = 0;   /* optional, default 0 = silent */
+    int is_csc = 0;    /* optional: the arrays are CSC (indptr over columns) instead of CSR */
 
-    if (!PyArg_ParseTuple(args, "OOOnidi|i",
+    if (!PyArg_ParseTuple(args, "OOOnidi|ii",
                           &data_obj, &indices_obj, &indptr_obj,
-                          &n_sst, &max_iter, &tol, &is_complex, &verbose))
+                          &n_sst, &max_iter, &tol, &is_complex, &verbose, &is_csc))
         return NULL;
 
     int64_t n = (int64_t)n_sst;
@@ -2031,6 +2127,24 @@ py_ruiz_equilibrate(PyObject *self, PyObject *args)
     /* found; it halves per iteration.                                     */
     /* ------------------------------------------------------------------ */
     for (int iter = 0; iter < max_iter; iter++) {
+        double res = 0.0;
+        if (is_csc) {
+            int64_t bad = ruiz_csc_iter(PyArray_DATA(data_arr), indices, indptr, n, is_complex, Dr, Dc, row_max, col_max, &res);
+            if (bad != 0) {
+                Py_DECREF(idx_arr); Py_DECREF(ptr_arr); Py_DECREF(data_arr);
+                free(Dr); free(Dc); free(row_max); free(col_max);
+                if (bad > 0)
+                    PyErr_Format(PyExc_RuntimeError,
+                        "Row %ld of the matrix is entirely zero (structural "
+                        "singularity detected during equilibration).", (long)(bad - 1));
+                else
+                    PyErr_Format(PyExc_RuntimeError,
+                        "Column %ld of the matrix is entirely zero (structural "
+                        "singularity detected during equilibration).", (long)(-bad - 1));
+                return NULL;
+            }
+            goto ruiz_iter_done;
+        }
         for (int64_t i = 0; i < n; i++) row_max[i] = 0.0;
         for (int64_t j = 0; j < n; j++) col_max[j] = 0.0;
         if (is_complex) {
@@ -2071,7 +2185,6 @@ py_ruiz_equilibrate(PyObject *self, PyObject *args)
                 return NULL;
             }
         }
-        double res = 0.0;
         for (int64_t i = 0; i < n; i++) {
             double v = 0.5 * fabs(log(row_max[i]));   /* |log| of the modulus */
             if (v > res) res = v;
@@ -2127,6 +2240,7 @@ py_ruiz_equilibrate(PyObject *self, PyObject *args)
             double *dd = (double *)PyArray_DATA(data_arr);
             for (int64_t p = 0; p < nnz; p++) dd[p] *= col_max[indices[p]];
         }
+ruiz_iter_done:
         iters_used = iter + 1;
         final_res  = res;
         if (verbose >= 2) {
@@ -3439,7 +3553,7 @@ static PyMethodDef SparseLUMethods[] = {
      "                        p (int64), q (int64).\n"
     },
     {"ruiz_equilibrate", py_ruiz_equilibrate, METH_VARARGS,
-     "ruiz_equilibrate(data, indices, indptr, n, max_iter, tol, is_complex)"
+     "ruiz_equilibrate(data, indices, indptr, n, max_iter, tol, is_complex[, verbose[, is_csc]])"
      " -> dict\n"
      "\n"
      "Ruiz iterative L-inf equilibration of a sparse matrix.\n"

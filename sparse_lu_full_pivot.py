@@ -343,32 +343,24 @@ def sparse_lu_full_pivot(
     # These operate on the sparsity PATTERN only and are applied before
     # equilibration so that Ruiz sees the reordered matrix.
     # ------------------------------------------------------------------
+    # The ordering and the supernodal kernel work on canonical CSC (sorted, no duplicates): at most one conversion,
+    # here, and none for CSC input.
+    A_csc = _canonical_csc(A)
     if colamd:
-        row_perm, col_perm = _colamd_permutations(
-            A, n, pin_dense_rows, tau_density, tau_min_nnz,
+        row_perm, col_perm, tr_count, tc_count = _colamd_permutations(
+            A_csc, n, pin_dense_rows, tau_density, tau_min_nnz,
             tau_row_mask, tau_col_mask, cache=cache_ordering, postorder=postorder)
         if verbose >= 1:
             if pin_dense_rows:
-                A_csr_v = A.tocsr() if not isinstance(A, csr_matrix) else A
-                if tau_row_mask is not None:
-                    tr_count = int(np.asarray(tau_row_mask, dtype=bool).sum())
-                else:
-                    tr_count = int(_detect_dense_lines(
-                        A_csr_v, n, tau_density, tau_min_nnz, axis=0).sum())
-                if tau_col_mask is not None:
-                    tc_count = int(np.asarray(tau_col_mask, dtype=bool).sum())
-                else:
-                    tc_count = int(_detect_dense_lines(
-                        A_csr_v, n, tau_density, tau_min_nnz, axis=1).sum())
                 print(f"[FPLUS]   COLAMD: pinned {tr_count} dense rows, "
                       f"{tc_count} dense columns")
             else:
                 print("[FPLUS]   COLAMD applied (no tau pinning)")
-        A_work = A.tocsr()[row_perm, :][:, col_perm].tocsr()
+        A_work = _permute_csc(A_csc, row_perm, col_perm)
     else:
         row_perm = np.arange(n, dtype=np.int64)
         col_perm = np.arange(n, dtype=np.int64)
-        A_work   = A
+        A_work   = A_csc
 
     # ------------------------------------------------------------------
     # Step 2: Numerical factorisation (with optional equilibration).
@@ -603,7 +595,7 @@ class SparseLU:
     """
 
     def __init__(self, A, **kwargs):
-        A_sp = sp.csr_matrix(A)
+        A_sp = A if (sp.issparse(A) and A.format in ("csc", "csr")) else sp.csc_matrix(A)
         self._A = A_sp
         L, U, p, q, Dr, Dc = sparse_lu_full_pivot(A_sp, _return_csc=True, **kwargs)
         self._L  = L.tocsc()
@@ -747,6 +739,27 @@ class SparseLU:
 
         return x
 
+def _canonical_csc(A) -> csc_matrix:
+    """A as CSC with sorted indices and no duplicates, copying only when it has to."""
+    A = A if isinstance(A, csc_matrix) else csc_matrix(A)
+    if not A.has_canonical_format:
+        A = A.copy()
+        A.sum_duplicates()
+    return A
+
+
+def _permute_csc(A_csc: csc_matrix, row_perm: np.ndarray, col_perm: np.ndarray) -> csc_matrix:
+    """A[row_perm, :][:, col_perm] as canonical CSC: a column gather, then a row relabelling (skipped for the identity)."""
+    B = A_csc[:, col_perm]
+    if not np.array_equal(row_perm, np.arange(len(row_perm))):
+        inv = np.empty(len(row_perm), dtype=np.int64)
+        inv[row_perm] = np.arange(len(row_perm), dtype=np.int64)
+        B.indices = inv[B.indices].astype(B.indices.dtype, copy=False)
+        B.has_sorted_indices = False
+        B.sort_indices()
+    return B
+
+
 def _detect_dense_lines(A_csr: csr_matrix, n: int,
                         tau_density: float, tau_min_nnz: int,
                         axis: int = 0) -> np.ndarray:
@@ -761,11 +774,11 @@ def _detect_dense_lines(A_csr: csr_matrix, n: int,
 
     Returns a boolean array of shape (n,).
     """
+    by_row = isinstance(A_csr, csr_matrix)          # CSR or CSC: counts from indptr or from the indices, no conversion
     if axis == 0:
-        nnz_per_line = np.diff(A_csr.indptr)
+        nnz_per_line = np.diff(A_csr.indptr) if by_row else np.bincount(A_csr.indices, minlength=n)
     else:
-        A_csc = A_csr.tocsc()
-        nnz_per_line = np.diff(A_csc.indptr)
+        nnz_per_line = np.bincount(A_csr.indices, minlength=n) if by_row else np.diff(A_csr.indptr)
     threshold = max(float(tau_density) * n, float(tau_min_nnz))
     return nnz_per_line > threshold
 
@@ -790,32 +803,23 @@ def _colamd_ordering(A_csr: csr_matrix, n: int,
     Returns col_perm (int64, length n): A[:, col_perm] is the
     column-reordered matrix.
     """
-    # Build a structural (pattern-only) CSR matrix with dense lines zeroed.
-    A_struct = A_csr.copy().tocsr()
-    A_struct.data = np.ones(A_struct.nnz, dtype=np.float64)
-
-    modified = False
-    if is_tau_row.any():
-        for i in np.where(is_tau_row)[0]:
-            A_struct.data[A_struct.indptr[i]:A_struct.indptr[i+1]] = 0.0
-        modified = True
-
-    if is_tau_col.any():
-        A_csc_struct = A_struct.tocsc()
-        for j in np.where(is_tau_col)[0]:
-            A_csc_struct.data[A_csc_struct.indptr[j]:A_csc_struct.indptr[j+1]] = 0.0
-        A_struct = A_csc_struct.tocsr()
-        modified = True
-
-    if modified:
-        A_struct.eliminate_zeros()
+    # The structural pattern in CSC, with the dense rows and columns removed (as zeroing them and eliminating would).
+    A_csc = _canonical_csc(A_csr)
+    indptr = A_csc.indptr.astype(np.int64, copy=False)
+    indices = A_csc.indices.astype(np.int64, copy=False)
+    if is_tau_row.any() or is_tau_col.any():
+        cols = np.repeat(np.arange(n, dtype=np.int64), np.diff(indptr))
+        keep = ~is_tau_row[indices] & ~is_tau_col[cols]
+        indices = indices[keep]
+        indptr = np.concatenate([[0], np.cumsum(np.bincount(cols[keep], minlength=n))]).astype(np.int64)
 
     # --- Primary path: direct call to SuiteSparse colamd_l via ctypes ---
-    perm = _colamd_ctypes(A_struct, n)
+    perm = _colamd_ctypes(indptr, indices, n)
     if perm is not None:
         return perm
 
     # --- Fallback: scipy splu with permc_spec='COLAMD' ---
+    A_struct = csc_matrix((np.ones(len(indices)), indices, indptr), shape=(n, n)).tocsr()
     return _colamd_splu_fallback(A_struct, n)
 
 
@@ -834,10 +838,9 @@ def clear_ordering_cache():
 
 def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask):
     import hashlib
-    A_csr = A.tocsr() if not isinstance(A, csr_matrix) else A
-    if not A_csr.has_sorted_indices:
-        A_csr = A_csr.copy(); A_csr.sort_indices()
+    A_csr = _canonical_csc(A)        # (the name is historical: the key is taken on canonical CSC)
     h = hashlib.blake2b(digest_size=20)
+    h.update(b"csc")
     h.update(np.ascontiguousarray(A_csr.indptr, dtype=np.int64).tobytes())
     h.update(np.ascontiguousarray(A_csr.indices, dtype=np.int64).tobytes())
     for m in (tau_row_mask, tau_col_mask):
@@ -862,7 +865,7 @@ def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row
             _ORDER_CACHE.popitem(last=False)
     else:
         _ORDER_CACHE.move_to_end(key)
-    return hit[0].copy(), hit[1].copy()
+    return hit[0].copy(), hit[1].copy(), hit[2], hit[3]
 
 
 def _colamd_permutations_uncached(
@@ -887,7 +890,7 @@ def _colamd_permutations_uncached(
     Returns permutations such that A[row_perm, :][:, col_perm] is the
     matrix to be passed to the numerical factorisation.
     """
-    A_csr = A.tocsr()
+    A_csr = _canonical_csc(A)        # (the name is historical: CSC, as the rest of the ordering)
 
     # -- Dense row detection ------------------------------------------------
     if pin_dense_rows:
@@ -929,7 +932,10 @@ def _colamd_permutations_uncached(
     #    (non-dense) rows and columns; dense columns stay pinned at the right end below.
     if postorder and _HAVE_C_EXT and hasattr(_sparse_lu_c, "coletree_postorder"):
         icols = colamd_perm[~is_tau_col[colamd_perm]]
-        B = A_csr[~is_tau_row, :][:, icols].tocsc()
+        B = A_csr[:, icols]
+        if is_tau_row.any():
+            B = B[~is_tau_row, :]
+        B = B.tocsc()
         post = _sparse_lu_c.coletree_postorder(B.indptr.astype(np.int64), B.indices.astype(np.int64), B.shape[0], B.shape[1])
         colamd_perm = np.concatenate([icols[post], colamd_perm[is_tau_col[colamd_perm]]]).astype(np.int64)
 
@@ -943,11 +949,11 @@ def _colamd_permutations_uncached(
     else:
         col_perm = colamd_perm
 
-    return row_perm, col_perm
+    return row_perm, col_perm, int(is_tau_row.sum()), int(is_tau_col.sum())
 
 
 
-def _colamd_ctypes(A_struct: csr_matrix, n: int) -> Optional[np.ndarray]:
+def _colamd_ctypes(indptr: np.ndarray, indices: np.ndarray, n: int) -> Optional[np.ndarray]:
     """
     Call colamd_l directly via ctypes.  Returns the column permutation
     as int64[n], or None if libcolamd is not available.
@@ -988,18 +994,17 @@ def _colamd_ctypes(A_struct: csr_matrix, n: int) -> Optional[np.ndarray]:
                               ctypes.POINTER(ctypes.c_double),
                               ctypes.POINTER(c_i64)]
 
-    A_csc = A_struct.tocsc()
     n_row = n
     n_col = n
-    nnz = A_csc.nnz
+    nnz = int(indptr[n])
 
     Alen = lib.colamd_l_recommended(c_i64(nnz), c_i64(n_row), c_i64(n_col))
     if Alen == 0:
         return None
 
     A_work = np.zeros(Alen, dtype=np.int64)
-    A_work[:nnz] = A_csc.indices.astype(np.int64)
-    col_ptrs = A_csc.indptr.astype(np.int64).copy()
+    A_work[:nnz] = indices[:nnz]
+    col_ptrs = np.array(indptr, dtype=np.int64)
 
     knobs = (ctypes.c_double * 20)()
     lib.colamd_l_set_defaults(knobs)
@@ -1043,13 +1048,14 @@ def _colamd_splu_fallback(A_struct: csr_matrix, n: int) -> np.ndarray:
 # C-extension factorisation path
 # ===========================================================================
 
-def _ruiz_c(A_csr, n, is_complex, target_dtype, verbose=0):
-    indices = A_csr.indices.astype(np.int64, copy=False)
-    indptr  = A_csr.indptr.astype(np.int64, copy=False)
-    data    = np.ascontiguousarray(A_csr.data, dtype=target_dtype)
+def _ruiz_c(A, n, is_complex, target_dtype, verbose=0):
+    """Ruiz on CSR or CSC arrays (the C routine's CSC variant gives the same Dr, Dc and scaled entries bit for bit)."""
+    indices = A.indices.astype(np.int64, copy=False)
+    indptr  = A.indptr.astype(np.int64, copy=False)
+    data    = np.ascontiguousarray(A.data, dtype=target_dtype)
     raw = _sparse_lu_c.ruiz_equilibrate(
         data, indices, indptr,
-        n, _RUIZ_MAX_ITER, _RUIZ_TOL, int(is_complex), int(verbose)
+        n, _RUIZ_MAX_ITER, _RUIZ_TOL, int(is_complex), int(verbose), int(isinstance(A, csc_matrix))
     )
     return raw["Dr"], raw["Dc"], raw["data"]
 
@@ -1059,32 +1065,35 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
                  pivot_rel=None):
     pivot_rel = float(np.sqrt(np.finfo(np.float64).eps)) if pivot_rel is None else float(pivot_rel)
     target_dtype = np.complex128 if is_complex else np.float64
-    A_csr = A.astype(target_dtype).tocsr()
-    A_csr.sort_indices()
+    A_csc = _canonical_csc(A)
+    if A_csc.dtype != target_dtype:
+        A_csc = A_csc.astype(target_dtype)
 
-    indices = A_csr.indices.astype(np.int64, copy=False)
-    indptr  = A_csr.indptr.astype(np.int64, copy=False)
+    indices = A_csc.indices.astype(np.int64, copy=False)
+    indptr  = A_csc.indptr.astype(np.int64, copy=False)
 
     if equilibrate:
-        Dr, Dc, data = _ruiz_c(A_csr, n, is_complex, target_dtype, verbose)
+        Dr, Dc, data = _ruiz_c(A_csc, n, is_complex, target_dtype, verbose)
     else:
         Dr   = np.ones(n, dtype=np.float64)
         Dc   = np.ones(n, dtype=np.float64)
-        data = np.ascontiguousarray(A_csr.data, dtype=target_dtype)
+        data = np.ascontiguousarray(A_csc.data, dtype=target_dtype)
 
     if pivot_code == _PIVOT_PARTIAL and drop_tol == 0.0 and hasattr(_sparse_lu_c, "lu_factor_sn"):
-        # the left-looking kernel takes CSC
-        A_csc = csr_matrix((data, indices, indptr), shape=(n, n)).tocsc()
+        # the left-looking kernel takes CSC: the arrays as they are
         raw = _sparse_lu_c.lu_factor_sn(
-            np.ascontiguousarray(A_csc.data, dtype=target_dtype),
-            A_csc.indices.astype(np.int64, copy=False),
-            A_csc.indptr.astype(np.int64, copy=False),
+            data, indices, indptr,
             n, int(is_complex), int(verbose), int(relax_rows), int(panel), int(bool(gpu)), float(gpu_min_flops), pivot_rel)
         # the kernel returns CSC; SparseLU keeps it (return_csc), the public function returns CSR
         fmt = csc_matrix if return_csc else (lambda *a, **k: csc_matrix(*a, **k).tocsr())   # noqa: E731
     else:
+        # the row-oriented kernel takes CSR
+        A_csr = csc_matrix((data, indices, indptr), shape=(n, n)).tocsr()
         raw = _sparse_lu_c.lu_factor(
-            data, indices, indptr, n, float(drop_tol), int(is_complex),
+            np.ascontiguousarray(A_csr.data, dtype=target_dtype),
+            A_csr.indices.astype(np.int64, copy=False),
+            A_csr.indptr.astype(np.int64, copy=False),
+            n, float(drop_tol), int(is_complex),
             int(verbose), int(pivot_code), pivot_rel
         )
         fmt = csr_matrix
