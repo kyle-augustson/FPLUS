@@ -3352,7 +3352,84 @@ done:
 /* =========================================================================
  * Module definition
  * ========================================================================= */
+
+/* =========================================================================
+ * Column elimination tree (the etree of A^T A, without forming it) and its
+ * postorder -- SuperLU's sp_coletree + TreePostorder.  Postordering the
+ * fill-reducing column order keeps the same elimination tree (so the same
+ * fill bound) and makes the columns of each subtree contiguous, which is
+ * what lets left-looking supernodal LU find wide supernodes.
+ * Input: CSC (indptr, indices) of the m x n column-permuted matrix.
+ * Output: post[k] = the column placed k-th.
+ * ========================================================================= */
+static int64_t ds_find(int64_t *pp, int64_t i)
+{
+    int64_t r = i;
+    while (pp[r] != r) r = pp[r];
+    while (pp[i] != r) { int64_t nx = pp[i]; pp[i] = r; i = nx; }   /* path compression */
+    return r;
+}
+
+static PyObject *
+py_coletree_postorder(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *ptr_o, *idx_o; Py_ssize_t m_s, n_s;
+    if (!PyArg_ParseTuple(args, "OOnn", &ptr_o, &idx_o, &m_s, &n_s)) return NULL;
+    int64_t m = (int64_t)m_s, n = (int64_t)n_s;
+    PyArrayObject *ptr_a = (PyArrayObject *)PyArray_FROM_OTF(ptr_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *idx_a = (PyArrayObject *)PyArray_FROM_OTF(idx_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    if (!ptr_a || !idx_a) { Py_XDECREF(ptr_a); Py_XDECREF(idx_a); return NULL; }
+    const int64_t *Ap = (const int64_t *)PyArray_DATA(ptr_a), *Ai = (const int64_t *)PyArray_DATA(idx_a);
+    npy_intp dn = (npy_intp)n;
+    PyArrayObject *post_a = (PyArrayObject *)PyArray_SimpleNew(1, &dn, NPY_INT64);
+    int64_t *firstcol = (int64_t *)malloc((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
+    int64_t *parent = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+    int64_t *pp = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t *root = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t *head = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+    int64_t *next = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t *stack = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+    if (!post_a || !firstcol || !parent || !pp || !root || !head || !next || !stack) {
+        free(firstcol); free(parent); free(pp); free(root); free(head); free(next); free(stack);
+        Py_XDECREF(post_a); Py_DECREF(ptr_a); Py_DECREF(idx_a); return PyErr_NoMemory();
+    }
+    int64_t *post = (int64_t *)PyArray_DATA(post_a);
+    for (int64_t r = 0; r < m; r++) firstcol[r] = n;
+    for (int64_t col = 0; col < n; col++)
+        for (int64_t q = Ap[col]; q < Ap[col + 1]; q++) { int64_t r = Ai[q]; if (r >= 0 && r < m && col < firstcol[r]) firstcol[r] = col; }
+    /* Liu's algorithm on the row-merged graph: each row is represented by its first column */
+    for (int64_t col = 0; col < n; col++) {
+        pp[col] = col; int64_t cset = col; root[cset] = col; parent[col] = n;
+        for (int64_t q = Ap[col]; q < Ap[col + 1]; q++) {
+            int64_t r = Ai[q]; if (r < 0 || r >= m) continue;
+            int64_t rc = firstcol[r]; if (rc >= col) continue;
+            int64_t rset = ds_find(pp, rc), rroot = root[rset];
+            if (rroot != col) {
+                parent[rroot] = col;
+                pp[rset] = cset;            /* link: rset joins cset (cset stays the representative) */
+                root[cset] = col;
+            }
+        }
+    }
+    /* children lists (in increasing column order), then a non-recursive DFS postorder from the virtual root n */
+    for (int64_t v = 0; v <= n; v++) head[v] = -1;
+    for (int64_t v = n - 1; v >= 0; v--) { int64_t p = parent[v]; next[v] = head[p]; head[p] = v; }
+    int64_t k = 0, top = 0; stack[0] = n;
+    while (top >= 0) {
+        int64_t v = stack[top], c = head[v];
+        if (c >= 0) { head[v] = next[c]; stack[++top] = c; }
+        else { top--; if (v < n) post[k++] = v; }
+    }
+    free(firstcol); free(parent); free(pp); free(root); free(head); free(next); free(stack);
+    Py_DECREF(ptr_a); Py_DECREF(idx_a);
+    if (k != n) { Py_DECREF(post_a); PyErr_SetString(PyExc_RuntimeError, "coletree_postorder: postorder incomplete"); return NULL; }
+    return (PyObject *)post_a;
+}
+
 static PyMethodDef SparseLUMethods[] = {
+    {"coletree_postorder", py_coletree_postorder, METH_VARARGS,
+     "coletree_postorder(indptr, indices, m, n) -> post: postorder of the column elimination tree of the m x n CSC matrix\n"},
     {"lu_factor", py_lu_factor, METH_VARARGS,
      "lu_factor(data, indices, indptr, n, drop_tol, is_complex) -> dict\n"
      "\n"

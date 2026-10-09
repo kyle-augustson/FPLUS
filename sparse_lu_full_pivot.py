@@ -143,6 +143,7 @@ def sparse_lu_full_pivot(
     gpu: bool = False,
     gpu_min_flops: float = 5e7,
     pivot_rel: Optional[float] = None,
+    postorder: bool = False,
     _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
@@ -257,6 +258,12 @@ def sparse_lu_full_pivot(
         Needs a device that reads pageable host memory (coherent CPU-GPU memory, e.g. NVLink-C2C); otherwise,
         or when CUDA is absent, the CPU path runs.  Default False.
 
+    postorder : bool, optional
+        With colamd=True: postorder the column elimination tree of the
+        COLAMD order (as SuperLU's sp_preorder).  Same elimination tree and
+        fill bound; each subtree's columns become contiguous, so the
+        supernodal kernel finds wider supernodes.  Default False.
+
     pivot_rel : float, optional
         Relative singular-pivot threshold: the factorization stops with
         "Matrix is singular" when the best available pivot is below
@@ -338,7 +345,7 @@ def sparse_lu_full_pivot(
     if colamd:
         row_perm, col_perm = _colamd_permutations(
             A, n, pin_dense_rows, tau_density, tau_min_nnz,
-            tau_row_mask, tau_col_mask, cache=cache_ordering)
+            tau_row_mask, tau_col_mask, cache=cache_ordering, postorder=postorder)
         if verbose >= 1:
             if pin_dense_rows:
                 A_csr_v = A.tocsr() if not isinstance(A, csr_matrix) else A
@@ -837,18 +844,18 @@ def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, t
     return (n, A_csr.nnz, bool(pin_dense_rows), float(tau_density), int(tau_min_nnz), h.hexdigest())
 
 
-def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, cache=True):
+def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, cache=True, postorder=False):
     """_colamd_permutations_uncached, cached by sparsity pattern (cache=True)."""
     global _ORDER_CACHE
     if not cache:
-        return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask)
+        return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
     from collections import OrderedDict
     if _ORDER_CACHE is None:
         _ORDER_CACHE = OrderedDict()
-    key = _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask)
+    key = (_pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask), bool(postorder))
     hit = _ORDER_CACHE.get(key)
     if hit is None:
-        hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask)
+        hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
         _ORDER_CACHE[key] = hit
         while len(_ORDER_CACHE) > _ORDER_CACHE_MAX:
             _ORDER_CACHE.popitem(last=False)
@@ -865,6 +872,7 @@ def _colamd_permutations_uncached(
     tau_min_nnz: int,
     tau_row_mask: Optional[np.ndarray],
     tau_col_mask: Optional[np.ndarray],
+    postorder: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute the (row_perm, col_perm) pair for COLAMD preprocessing.
@@ -915,6 +923,14 @@ def _colamd_permutations_uncached(
 
     # -- COLAMD column ordering (dense rows+cols excluded from analysis) -----
     colamd_perm = _colamd_ordering(A_csr, n, is_tau_row, is_tau_col)
+    # -- Optional postorder of the column elimination tree (SuperLU's sp_preorder): same etree, same fill bound, but
+    #    every subtree's columns contiguous, so the supernodal kernel can find wide supernodes.  On the interior
+    #    (non-dense) rows and columns; dense columns stay pinned at the right end below.
+    if postorder and _HAVE_C_EXT and hasattr(_sparse_lu_c, "coletree_postorder"):
+        icols = colamd_perm[~is_tau_col[colamd_perm]]
+        B = A_csr[~is_tau_row, :][:, icols].tocsc()
+        post = _sparse_lu_c.coletree_postorder(B.indptr.astype(np.int64), B.indices.astype(np.int64), B.shape[0], B.shape[1])
+        colamd_perm = np.concatenate([icols[post], colamd_perm[is_tau_col[colamd_perm]]]).astype(np.int64)
 
     # -- Pin dense columns to the right end of the column permutation -------
     if is_tau_col.any():
