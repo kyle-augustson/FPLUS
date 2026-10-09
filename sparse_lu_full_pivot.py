@@ -143,7 +143,7 @@ def sparse_lu_full_pivot(
     gpu: bool = False,
     gpu_min_flops: float = 5e7,
     pivot_rel: Optional[float] = None,
-    postorder: bool = False,
+    postorder: bool = True,
     _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
@@ -262,7 +262,8 @@ def sparse_lu_full_pivot(
         With colamd=True: postorder the column elimination tree of the
         COLAMD order (as SuperLU's sp_preorder).  Same elimination tree and
         fill bound; each subtree's columns become contiguous, so the
-        supernodal kernel finds wider supernodes.  Default False.
+        supernodal kernel finds wider supernodes.  Default True (False
+        restores the plain COLAMD order of earlier versions).
 
     pivot_rel : float, optional
         Relative singular-pivot threshold: the factorization stops with
