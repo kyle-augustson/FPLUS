@@ -116,6 +116,10 @@ _PIVOT_NAMES = {
 # Module-level defaults
 # ---------------------------------------------------------------------------
 _RUIZ_MAX_ITER = 20
+# FPLUS_PY_ORDERING=1 forces the Python ordering / permutation / C-kernel route even when the C pipeline
+# (analyze, factor_sn_perm) is available -- for comparisons; the two routes give bit-identical factors.
+import os as _os
+_PY_PIPELINE = _os.environ.get("FPLUS_PY_ORDERING") == "1"
 _RUIZ_TOL      = 1e-2
 
 
@@ -356,8 +360,11 @@ def sparse_lu_full_pivot(
                       f"{tc_count} dense columns")
             else:
                 print("[FPLUS]   COLAMD applied (no tau pinning)")
-        A_work = _permute_csc(A_csc, row_perm, col_perm)
+        use_c_pipeline = (_HAVE_C_EXT and hasattr(_sparse_lu_c, "factor_sn_perm") and not _PY_PIPELINE
+                          and pivot_code == _PIVOT_PARTIAL and drop_tol == 0.0)
+        A_work = None if use_c_pipeline else _permute_csc(A_csc, row_perm, col_perm)
     else:
+        use_c_pipeline = False
         row_perm = np.arange(n, dtype=np.int64)
         col_perm = np.arange(n, dtype=np.int64)
         A_work   = A_csc
@@ -365,7 +372,11 @@ def sparse_lu_full_pivot(
     # ------------------------------------------------------------------
     # Step 2: Numerical factorisation (with optional equilibration).
     # ------------------------------------------------------------------
-    if _HAVE_C_EXT:
+    if use_c_pipeline:
+        L, U, p_lu, q_lu, Dr, Dc = _lu_factor_c_perm(
+            A_csc, row_perm, col_perm, n, equilibrate, is_complex, verbose, _return_csc, relax_rows, panel, gpu,
+            gpu_min_flops, pivot_rel)
+    elif _HAVE_C_EXT:
         L, U, p_lu, q_lu, Dr, Dc = _lu_factor_c(
             A_work, n, drop_tol, equilibrate, is_complex, dtype,
             verbose, pivot_code, _return_csc, relax_rows, panel, gpu, gpu_min_flops, pivot_rel)
@@ -891,6 +902,20 @@ def _colamd_permutations_uncached(
     matrix to be passed to the numerical factorisation.
     """
     A_csr = _canonical_csc(A)        # (the name is historical: CSC, as the rest of the ordering)
+    masks = []
+    for name, m in (("tau_row_mask", tau_row_mask), ("tau_col_mask", tau_col_mask)):
+        if pin_dense_rows and m is not None:
+            m = np.asarray(m, dtype=bool)
+            if m.shape != (n,):
+                raise ValueError(f"{name} must have shape ({n},); got {m.shape}.")
+        masks.append(None if m is None else np.ascontiguousarray(np.asarray(m, dtype=bool), dtype=np.uint8))
+
+    # -- The C ordering (fplus_analyze): the same steps as below, in C, with COLAMD linked at build time ----
+    if _HAVE_C_EXT and hasattr(_sparse_lu_c, "analyze") and not _PY_PIPELINE:
+        r = _sparse_lu_c.analyze(A_csr.indptr.astype(np.int64, copy=False), A_csr.indices.astype(np.int64, copy=False), n,
+                                 int(bool(pin_dense_rows)), float(tau_density), int(tau_min_nnz), masks[0], masks[1],
+                                 int(bool(postorder)))
+        return r["row_perm"], r["col_perm"], int(r["n_dense_rows"]), int(r["n_dense_cols"])
 
     # -- Dense row detection ------------------------------------------------
     if pin_dense_rows:
@@ -1058,6 +1083,25 @@ def _ruiz_c(A, n, is_complex, target_dtype, verbose=0):
         n, _RUIZ_MAX_ITER, _RUIZ_TOL, int(is_complex), int(verbose), int(isinstance(A, csc_matrix))
     )
     return raw["Dr"], raw["Dc"], raw["data"]
+
+
+def _lu_factor_c_perm(A_csc, row_perm, col_perm, n, equilibrate, is_complex, verbose=0, return_csc=False, relax_rows=0,
+                      panel=1, gpu=False, gpu_min_flops=5e7, pivot_rel=None):
+    """The C pipeline (fplus_factor_sn_perm): A[row_perm, :][:, col_perm], Ruiz on CSC, the supernodal kernel -- the same
+    factors as _permute_csc followed by _lu_factor_c, without the Python copies."""
+    pivot_rel = float(np.sqrt(np.finfo(np.float64).eps)) if pivot_rel is None else float(pivot_rel)
+    target_dtype = np.complex128 if is_complex else np.float64
+    A_c = _canonical_csc(A_csc)
+    data = np.ascontiguousarray(A_c.data, dtype=target_dtype)
+    raw = _sparse_lu_c.factor_sn_perm(
+        data, A_c.indices.astype(np.int64, copy=False), A_c.indptr.astype(np.int64, copy=False), n,
+        np.ascontiguousarray(row_perm, dtype=np.int64), np.ascontiguousarray(col_perm, dtype=np.int64), int(is_complex),
+        int(bool(equilibrate)), _RUIZ_MAX_ITER, _RUIZ_TOL, int(verbose), int(relax_rows), int(panel), int(bool(gpu)),
+        float(gpu_min_flops), pivot_rel)
+    fmt = csc_matrix if return_csc else (lambda *a, **k: csc_matrix(*a, **k).tocsr())   # noqa: E731
+    L = fmt((raw["L_data"], raw["L_indices"], raw["L_indptr"]), shape=(n, n), dtype=target_dtype)
+    U = fmt((raw["U_data"], raw["U_indices"], raw["U_indptr"]), shape=(n, n), dtype=target_dtype)
+    return L, U, raw["p"], raw["q"], raw["Dr"], raw["Dc"]
 
 
 def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,

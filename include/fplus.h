@@ -73,6 +73,38 @@ int fplus_tri_solve(int64_t n, const int64_t *Lp, const int64_t *Li, const void 
  * post[k] = the column placed k-th. */
 int fplus_coletree_postorder(int64_t m, int64_t n, const int64_t *Ap, const int64_t *Ai, int64_t *post);
 
+/* ---- symbolic analysis: the static orders of one sparsity pattern, reusable for any values on it ---- */
+typedef struct fplus_symbolic fplus_symbolic;
+
+/* Dense-line pinning (a row / column is dense with more than max(tau_density n, tau_min_nnz) entries, or as given by the
+ * 0/1 masks when not NULL), COLAMD on the remaining pattern, and (postorder) the column-etree postorder.  Ap, Ai: the
+ * n x n pattern in canonical CSC (rows ascending in each column, no duplicates).  Dense rows go last in the row order,
+ * dense columns last in the column order. */
+int fplus_analyze(int64_t n, const int64_t *Ap, const int64_t *Ai, int pin_dense, double tau_density, int64_t tau_min_nnz,
+                  const unsigned char *tau_row_mask, const unsigned char *tau_col_mask, int postorder,
+                  fplus_symbolic **sym, char *err, size_t errlen);
+void fplus_symbolic_free(fplus_symbolic *sym);
+int64_t fplus_symbolic_n(const fplus_symbolic *sym);
+int64_t fplus_symbolic_nnz(const fplus_symbolic *sym);
+const int64_t *fplus_symbolic_row_perm(const fplus_symbolic *sym);   /* A[row_perm, :][:, col_perm] is factored */
+const int64_t *fplus_symbolic_col_perm(const fplus_symbolic *sym);
+int64_t fplus_symbolic_n_dense_rows(const fplus_symbolic *sym);
+int64_t fplus_symbolic_n_dense_cols(const fplus_symbolic *sym);
+
+/* The supernodal factorization of A[row_perm, :][:, col_perm] (A canonical CSC): the permuted matrix, Ruiz (when
+ * equilibrate; Dr, Dc of length n filled, in the permuted order), then fplus_factor_sn.  The factors and p, q refer to
+ * the permuted matrix. */
+int fplus_factor_sn_perm(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                         const int64_t *row_perm, const int64_t *col_perm,
+                         int equilibrate, int ruiz_max_iter, double ruiz_tol, int verbose,
+                         int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops, double pivot_rel,
+                         fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen);
+/* the same with the orders of a symbolic analysis (the pattern must be the analysed one) */
+int fplus_factor_sn_sym(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                        int equilibrate, int ruiz_max_iter, double ruiz_tol, int verbose,
+                        int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops, double pivot_rel,
+                        fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen);
+
 #ifdef __cplusplus
 }
 #endif

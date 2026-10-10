@@ -75,7 +75,15 @@ complex check), and the pytest suite passing.
    calls, and `_sparse_lu_c.c` is the wrapper. The GIL release moved up from phase 3: two factorizations from two Python threads run
    1.8x faster than one after the other. Factors are bit-identical to 266c55e on the 25,972-row pencil, and pytest passes 61/61.
 2. **Ordering in C.** Port dense-line pinning, the COLAMD call (linked `colamd_l`), the postorder and the permutation; add
-   `fplus_analyze`. The Python ordering cache becomes a cache of symbolic handles.
+   `fplus_analyze`. **Done:**
+   - `fplus_analyze` and the symbolic handle (`src/order.c`), and `fplus_factor_sn_perm` / `_sym` (`src/pipeline.c`: permute in
+     parallel, Ruiz on CSC, the supernodal kernel). COLAMD is linked at build time; `setup.py` fails without it.
+   - The symbolic object keeps only the orders: a permuted pattern plus value map would be ~6 GB at 3.6e8 nonzeros. So the
+     existing Python LRU cache of orders stays, and the C pipeline re-applies them.
+   - COLAMD's 1.2 GB workspace is allocated with transparent huge pages (`fplus_calloc_huge`): 5.7 -> 3.8 s, the same as numpy's
+     allocation in the old ctypes route.
+   - Checks: bit-identical to the Python route in 160 randomized cases (118 with pinned dense rows / columns, explicit masks,
+     postorder on / off, pinning off), and to 266c55e on the 25,972-row pencil. `FPLUS_PY_ORDERING=1` forces the old route.
 3. **CMake and packaging.** CMake for the library (BLAS vendor, OpenMP, SuiteSparse, GPU) and scikit-build-core for the extension.
    Release the GIL around analyze / factor / solve. Add C tests and an example program.
 4. **Afterwards.** Multiple right-hand sides in the solves, GPU-resident updates (cuBLAS / hipBLAS), HIP on the MI300X.

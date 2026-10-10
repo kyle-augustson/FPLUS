@@ -96,6 +96,7 @@
 #include <complex.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include "fplus.h"
 
 /* This file is the CPython wrapper only (phase 1 of docs/C_LIBRARY_PLAN.md): argument parsing, numpy arrays, the
@@ -308,7 +309,106 @@ py_coletree_postorder(PyObject *self, PyObject *args)
     return (PyObject *)post_a;
 }
 
+static PyObject *
+py_analyze(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *ptr_o, *idx_o, *rmask_o = Py_None, *cmask_o = Py_None;
+    Py_ssize_t n_s; int pin_dense = 1, postorder = 1; double tau_density = 0.5; long long tau_min_nnz = 10;
+    if (!PyArg_ParseTuple(args, "OOn|idLOOi", &ptr_o, &idx_o, &n_s, &pin_dense, &tau_density, &tau_min_nnz, &rmask_o, &cmask_o, &postorder))
+        return NULL;
+    int64_t n = (int64_t)n_s;
+    PyArrayObject *ptr_a = (PyArrayObject *)PyArray_FROM_OTF(ptr_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *idx_a = (PyArrayObject *)PyArray_FROM_OTF(idx_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *rm_a = rmask_o == Py_None ? NULL : (PyArrayObject *)PyArray_FROM_OTF(rmask_o, NPY_UINT8, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *cm_a = cmask_o == Py_None ? NULL : (PyArrayObject *)PyArray_FROM_OTF(cmask_o, NPY_UINT8, NPY_ARRAY_IN_ARRAY);
+    PyObject *result = NULL;
+    if (!ptr_a || !idx_a || (rmask_o != Py_None && !rm_a) || (cmask_o != Py_None && !cm_a)) goto done;
+    if (PyArray_DIM(ptr_a, 0) != n + 1 || (rm_a && PyArray_DIM(rm_a, 0) != n) || (cm_a && PyArray_DIM(cm_a, 0) != n)) {
+        PyErr_SetString(PyExc_ValueError, "analyze: indptr must have length n + 1 and the masks length n"); goto done;
+    }
+    {
+        fplus_symbolic *sym = NULL; char err[512] = {0}; int rc;
+        Py_BEGIN_ALLOW_THREADS
+        rc = fplus_analyze(n, (const int64_t *)PyArray_DATA(ptr_a), (const int64_t *)PyArray_DATA(idx_a), pin_dense, tau_density,
+                           (int64_t)tau_min_nnz, rm_a ? (const unsigned char *)PyArray_DATA(rm_a) : NULL,
+                           cm_a ? (const unsigned char *)PyArray_DATA(cm_a) : NULL, postorder, &sym, err, sizeof(err));
+        Py_END_ALLOW_THREADS
+        if (rc != FPLUS_OK) { raise_fplus(rc, err); goto done; }
+        npy_intp dn = (npy_intp)n;
+        PyArrayObject *rp = (PyArrayObject *)PyArray_SimpleNew(1, &dn, NPY_INT64);
+        PyArrayObject *cp = (PyArrayObject *)PyArray_SimpleNew(1, &dn, NPY_INT64);
+        if (rp && cp) {
+            memcpy(PyArray_DATA(rp), fplus_symbolic_row_perm(sym), (size_t)n * sizeof(int64_t));
+            memcpy(PyArray_DATA(cp), fplus_symbolic_col_perm(sym), (size_t)n * sizeof(int64_t));
+            result = Py_BuildValue("{s:O,s:O,s:L,s:L}", "row_perm", rp, "col_perm", cp,
+                                   "n_dense_rows", (long long)fplus_symbolic_n_dense_rows(sym), "n_dense_cols", (long long)fplus_symbolic_n_dense_cols(sym));
+        }
+        Py_XDECREF(rp); Py_XDECREF(cp);
+        fplus_symbolic_free(sym);
+    }
+done:
+    Py_XDECREF(ptr_a); Py_XDECREF(idx_a); Py_XDECREF(rm_a); Py_XDECREF(cm_a);
+    return result;
+}
+
+static PyObject *
+py_factor_sn_perm(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *data_obj, *indices_obj, *indptr_obj, *rp_o, *cp_o;
+    Py_ssize_t n_sst;
+    int is_complex, equilibrate = 1, ruiz_max_iter = 20, verbose = 0, use_gpu = 0;
+    double ruiz_tol = 1e-2, gpu_min_flops = 5e7, pivot_rel = FPLUS_PIVOT_REL_DEFAULT;
+    long long relax_rows = 0, panel = 1;
+    if (!PyArg_ParseTuple(args, "OOOnOOi|iidiLLidd", &data_obj, &indices_obj, &indptr_obj, &n_sst, &rp_o, &cp_o, &is_complex,
+                          &equilibrate, &ruiz_max_iter, &ruiz_tol, &verbose, &relax_rows, &panel, &use_gpu, &gpu_min_flops, &pivot_rel))
+        return NULL;
+    int64_t n = (int64_t)n_sst;
+    PyArrayObject *data_arr = (PyArrayObject *)PyArray_FROM_OTF(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *idx_arr = (PyArrayObject *)PyArray_FROM_OTF(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *ptr_arr = (PyArrayObject *)PyArray_FROM_OTF(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *rp_arr = (PyArrayObject *)PyArray_FROM_OTF(rp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *cp_arr = (PyArrayObject *)PyArray_FROM_OTF(cp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    double *Dr = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    double *Dc = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    PyObject *result = NULL;
+    if (!data_arr || !idx_arr || !ptr_arr || !rp_arr || !cp_arr) goto done;
+    if (!Dr || !Dc) { PyErr_NoMemory(); goto done; }
+    if (PyArray_DIM(ptr_arr, 0) != n + 1 || PyArray_DIM(rp_arr, 0) != n || PyArray_DIM(cp_arr, 0) != n) {
+        PyErr_SetString(PyExc_ValueError, "factor_sn_perm: indptr must have length n + 1 and the permutations length n"); goto done;
+    }
+    {
+        fplus_factors f; char err[512] = {0}; int rc;
+        Py_BEGIN_ALLOW_THREADS
+        rc = fplus_factor_sn_perm(n, (const int64_t *)PyArray_DATA(ptr_arr), (const int64_t *)PyArray_DATA(idx_arr), PyArray_DATA(data_arr),
+                                  is_complex, (const int64_t *)PyArray_DATA(rp_arr), (const int64_t *)PyArray_DATA(cp_arr),
+                                  equilibrate, ruiz_max_iter, ruiz_tol, verbose, (int64_t)relax_rows, (int64_t)panel, use_gpu,
+                                  gpu_min_flops, pivot_rel, &f, Dr, Dc, err, sizeof(err));
+        Py_END_ALLOW_THREADS
+        if (rc != FPLUS_OK) { raise_fplus(rc, err); goto done; }
+        result = factors_to_dict(&f);
+        if (!result) goto done;
+        PyObject *Dr_arr = wrap_array(Dr, (npy_intp)n, NPY_FLOAT64); if (Dr_arr) Dr = NULL;
+        PyObject *Dc_arr = wrap_array(Dc, (npy_intp)n, NPY_FLOAT64); if (Dc_arr) Dc = NULL;
+        if (!Dr_arr || !Dc_arr || PyDict_SetItemString(result, "Dr", Dr_arr) || PyDict_SetItemString(result, "Dc", Dc_arr)) {
+            Py_CLEAR(result); if (!PyErr_Occurred()) PyErr_NoMemory();
+        }
+        Py_XDECREF(Dr_arr); Py_XDECREF(Dc_arr);
+    }
+done:
+    free(Dr); free(Dc);
+    Py_XDECREF(data_arr); Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); Py_XDECREF(rp_arr); Py_XDECREF(cp_arr);
+    return result;
+}
+
 static PyMethodDef SparseLUMethods[] = {
+    {"analyze", py_analyze, METH_VARARGS,
+     "analyze(indptr, indices, n[, pin_dense, tau_density, tau_min_nnz, row_mask, col_mask, postorder]) -> dict\n"
+     "Static orders of a canonical CSC pattern: row_perm, col_perm (A[row_perm][:, col_perm] is factored), n_dense_rows, n_dense_cols.\n"},
+    {"factor_sn_perm", py_factor_sn_perm, METH_VARARGS,
+     "factor_sn_perm(data, indices, indptr, n, row_perm, col_perm, is_complex[, equilibrate, ruiz_max_iter, ruiz_tol, verbose,\n"
+     "               relax_rows, panel, use_gpu, gpu_min_flops, pivot_rel]) -> dict of the factors of the permuted matrix with Dr, Dc\n"},
     {"coletree_postorder", py_coletree_postorder, METH_VARARGS,
      "coletree_postorder(indptr, indices, m, n) -> post: postorder of the column elimination tree of the m x n CSC matrix\n"},
     {"lu_factor", py_lu_factor, METH_VARARGS,
