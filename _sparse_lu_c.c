@@ -154,6 +154,9 @@ extern void cblas_zgemv(int order, int trans, int M, int N, const void *alpha,
 #    define SN_BLAS_MIN 256   /* segment columns x rest rows below which the loops are used */
 #  endif
 #endif
+#ifndef SN_PAR_MIN
+#  define SN_PAR_MIN 16384   /* entries below which the gather / scatter / L-store loops stay serial (OpenMP) */
+#endif
 
 /* ------------------------------------------------------------------------- *
  * Verbose-mode helpers
@@ -2901,6 +2904,10 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                 const int64_t *rows = S->rows;
                 if (capXS < m * pc) { free(XS); capXS = 2 * m * pc; XS = (T *)malloc((size_t)capXS * sizeof(T)); if (!XS) goto out; }
                 if (capYB < nrest * pc) { free(YB); capYB = 2 * nrest * pc + 1; YB = (T *)malloc((size_t)capYB * sizeof(T)); if (!YB) goto out; }
+                /* gather and scatter: each panel column has its own accumulator column, so the columns are independent */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (pc > 1 && pc * m >= SN_PAR_MIN)
+#endif
                 for (int64_t q = c0; q < c1; q++) {
                     const T *x = X + (size_t)ucol.a[q] * n; T *xs = XS + (q - c0) * m;
                     for (int64_t cc = 0; cc < m; cc++) xs[cc] = x[rows[kfa + cc]];
@@ -2916,6 +2923,9 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                     } else
                         cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
                 }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (pc > 1 && pc * (m + nrest) >= SN_PAR_MIN)
+#endif
                 for (int64_t q = c0; q < c1; q++) {
                     T *x = X + (size_t)ucol.a[q] * n; const T *xs = XS + (q - c0) * m, *yb = YB + (q - c0) * nrest;
                     for (int64_t cc = 0; cc < m; cc++) x[rows[kfa + cc]] = xs[cc];
@@ -3074,6 +3084,10 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                 T *Bc = B + w * ld;
                 for (int64_t rr = 0; rr < w; rr++) Bc[rr] = x[S->rows[rr]];
                 Bc[w] = 1;
+                /* the L column: one complex division per row, independent rows */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (r1 - w - 1 >= SN_PAR_MIN)
+#endif
                 for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;
                 S->ncols = w + 1;
                 col_sn[j] = open;
