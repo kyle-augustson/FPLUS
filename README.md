@@ -18,7 +18,58 @@ Key features:
 - **Optional BLAS axpy** for dense rows (build with `SPARSE_LU_BLAS=1`)
 - **Drop-in interface** for `scipy.sparse.linalg.splu` via the `SparseLU` class
 
-## Building the C extension
+## The C library
+
+The factorization is a C library (`include/fplus.h`, `src/`) that the Python
+module wraps.  It builds with CMake and needs SuiteSparse COLAMD, a BLAS with
+the CBLAS interface (optional), and OpenMP (optional):
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$CONDA_PREFIX    # or wherever SuiteSparse lives
+cmake --build build -j 4
+ctest --test-dir build                                    # the C tests
+./build/fplus_example                                     # examples/solve.c
+cmake --install build --prefix /some/prefix               # libfplus.so + fplus.h
+```
+
+CMake options:
+
+| option | default | |
+|---|---|---|
+| `FPLUS_OPENMP` | `ON` | OpenMP parallel loops |
+| `FPLUS_BLAS` | `ON` | BLAS kernels (CBLAS interface) |
+| `FPLUS_BLAS_LIBRARIES` | search | the BLAS link line, e.g. `-lopenblas` or a library path |
+| `FPLUS_MARCH` | `native` | `-march` value; set `x86-64-v3` (or empty) for a build that must run on other CPUs |
+| `FPLUS_PROFILE` | `OFF` | phase timers in the supernodal kernel |
+| `FPLUS_BUILD_TESTS`, `FPLUS_BUILD_EXAMPLES` | `ON` | |
+
+The high-level interface: options, then analyze (the ordering, reusable for
+any values on the same pattern), factor, and solve with `A`, `A^T` or `A^H`:
+
+```c
+fplus_options opt;  fplus_default_options(&opt);   /* relax 32, panel 512, COLAMD, Ruiz */
+fplus_symbolic *sym;  fplus_analyze_opts(n, Ap, Ai, &opt, &sym, err, sizeof err);
+fplus_numeric  *num;  fplus_factor(sym, Ap, Ai, Ax, /*complex*/ 1, &opt, &num, err, sizeof err);
+fplus_solve(num, b, nrhs, ldb, /*0: A, 1: A^T, 2: A^H*/ 0, err, sizeof err);
+fplus_numeric_free(num);  fplus_symbolic_free(sym);
+```
+
+Matrices are canonical CSC (rows ascending in each column, no duplicates) with
+int64 indices; values are `double` or `double complex`.  Every call returns
+`FPLUS_OK` or an error code with a message in `err`.  The lower-level kernels
+(the supernodal and row factorizations, Ruiz, the triangular solves) are in
+the same header.
+
+## Installing the Python package
+
+```bash
+pip install .            # scikit-build-core drives the CMake build
+```
+
+`CMAKE_PREFIX_PATH` (or `CMAKE_ARGS="-DFPLUS_BLAS_LIBRARIES=..."`) points the
+build at SuiteSparse and BLAS as above.
+
+## Building the C extension in place (setup.py)
 
 From this directory (`dedalus/libraries/FPLUS/`):
 
@@ -151,7 +202,8 @@ magnitude denser than partial pivoting on banded matrices.
 ## Testing
 
 ```bash
-python test_sparse_lu_full_pivot.py
+python -m pytest test_sparse_lu_full_pivot.py test_audit_2026_10_10.py
+ctest --test-dir build          # the C tests, after a CMake build
 ```
 
 54 unit tests covering factorization residual, solve accuracy, COLAMD
@@ -160,11 +212,15 @@ class (including transpose / conjugate-transpose solves).
 
 ## Files
 
-- `_sparse_lu_c.c`           — C extension source (LU + Ruiz + BLAS axpy)
+- `include/fplus.h`          — the C interface
+- `src/`                     — the C library: supernodal and row kernels, Ruiz, solves, ordering, the high-level interface
+- `_sparse_lu_c.c`           — the CPython extension (wraps the library; releases the GIL)
 - `sparse_lu_full_pivot.py`  — Python wrapper module
-- `setup.py`                 — C extension build script
+- `CMakeLists.txt`, `pyproject.toml` — the CMake build and the Python package
+- `setup.py`                 — in-place extension build
 - `__init__.py`              — package re-exports
-- `test_sparse_lu_full_pivot.py` — unit tests
+- `tests/c/`, `examples/`    — C tests (ctest) and an example program
+- `test_sparse_lu_full_pivot.py`, `test_audit_2026_10_10.py` — Python unit tests
 
 ## License
 

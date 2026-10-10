@@ -151,8 +151,37 @@ static int64_t ruiz_csc_iter(void *data, const int64_t *indices, const int64_t *
 int fplus_ruiz(int64_t n, const int64_t *indptr, const int64_t *indices, void *data, int is_complex, int is_csc,
                int max_iter, double tol, int verbose, double *Dr, double *Dc, char *err, size_t errlen)
 {
-    { int vrc = fplus_check_compressed(n, indptr, indices, 0, err, errlen); if (vrc != FPLUS_OK) return vrc; }
+    { int vrc = fplus_check_compressed(n, indptr, indices, 0, err, errlen);
+      if (vrc == FPLUS_OK) vrc = fplus_check_finite(indptr[n], data, is_complex, err, errlen);
+      if (vrc != FPLUS_OK) return vrc; }
     int64_t nnz = indptr[n];
+    /* Range guard (audit 2026-10-10).  The iteration compares squared moduli, which overflow above ~1e154 and underflow below
+     * ~1e-162 (a false "entirely zero" line).  When some |re| / |im| lies outside [2^-500, 2^500], the data are scaled by an
+     * exact power of two 2^k (k a multiple of 4, so every square root of it below is exact too), equilibrated, and 2^(k/2) is
+     * folded into Dr and Dc: the same scaled matrix diag(Dr) A diag(Dc).  Inputs inside the range are untouched (bit-identical). */
+    int k4 = 0;
+    {
+        const double *d = (const double *)data;
+        const int64_t m = is_complex ? 2 * nnz : nnz;
+        double amax = 0.0, amin = INFINITY;
+        for (int64_t q = 0; q < m; q++) {
+            double a = fabs(d[q]);
+            if (a > amax) amax = a;
+            if (a > 0.0 && a < amin) amin = a;
+        }
+        if (amax > 0.0 && (amax > 0x1p500 || amin < 0x1p-500)) {
+            int emax = ilogb(amax), emin = ilogb(amin);
+            if (emax - emin > 990) {
+                fplus_errf(err, errlen, "entries span 2^%d .. 2^%d: wider than Ruiz equilibration can handle in double precision",
+                           emin, emax);
+                return FPLUS_ERR_BADARG;
+            }
+            k4 = -((emax + emin) / 2 / 4) * 4;
+            const double sc = ldexp(1.0, k4);
+            double *dd = (double *)data;
+            for (int64_t q = 0; q < m; q++) dd[q] *= sc;
+        }
+    }
     double *row_max = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
     double *col_max = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
     if (!row_max || !col_max) {
@@ -324,5 +353,9 @@ ruiz_iter_done:
         fflush(stdout);
     }
 
+    if (k4 != 0) {   /* fold the range-guard scaling back: diag(Dr) A diag(Dc) = diag(Dr') (2^k A) diag(Dc') */
+        const double h = ldexp(1.0, k4 / 2);
+        for (int64_t i = 0; i < n; i++) { Dr[i] *= h; Dc[i] *= h; }
+    }
     return FPLUS_OK;
 }

@@ -98,7 +98,7 @@ extra_link_args.extend([f"-L{ss_lib}", f"-Wl,-rpath,{ss_lib}"])
 
 ext = Extension(
     name="_sparse_lu_c",
-    sources=["_sparse_lu_c.c", "src/factor_row.c", "src/factor_sn.c", "src/equil.c", "src/solve.c", "src/order.c", "src/pipeline.c"],
+    sources=["_sparse_lu_c.c", "src/factor_row.c", "src/factor_sn.c", "src/equil.c", "src/solve.c", "src/order.c", "src/pipeline.c", "src/numeric.c"],
     include_dirs=[np.get_include(), "include", "src", ss_inc],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
@@ -112,12 +112,12 @@ blas_note = " (BLAS enabled)"   if use_blas   else \
             " (set SPARSE_LU_BLAS=1 to enable the BLAS kernels)"
 print(f"Building _sparse_lu_c{omp_note}{blas_note} (COLAMD: {ss_lib})")
 
+# The in-place build (python setup.py build_ext --inplace).  The project metadata is in pyproject.toml, whose CMake build
+# (scikit-build-core) makes the installable package; the explicit package_dir stops setuptools' src-layout discovery from
+# taking src/ (the C sources) for the package directory.
 setup(
-    name="sparse_lu_full_pivot",
-    version="0.4.0",
-    description="Sparse LU with full/partial/rook pivoting (C extension)",
     ext_modules=[ext],
-    license="GPL-3.0-or-later",
-    python_requires=">=3.9",
-    install_requires=["numpy>=1.22", "scipy>=1.9"],
+    package_dir={"": "."},
+    packages=[],
+    py_modules=[],
 )

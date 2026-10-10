@@ -106,6 +106,46 @@ int fplus_factor_sn_sym(const fplus_symbolic *sym, const int64_t *Ap, const int6
                         int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops, double pivot_rel,
                         fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen);
 
+/* ---- the high-level interface: options, analyze, factor, solve ---- */
+typedef struct {
+    int     pin_dense;          /* dense rows / columns last (default 1) */
+    double  tau_density;        /* a line is dense with more than max(tau_density n, tau_min_nnz) entries (0.5) */
+    int64_t tau_min_nnz;        /* (10) */
+    int     postorder;          /* column-etree postorder after COLAMD (1) */
+    int     equilibrate;        /* Ruiz (1) */
+    int     ruiz_max_iter;      /* (20) */
+    double  ruiz_tol;           /* (1e-2) */
+    double  pivot_rel;          /* singular when the best pivot < pivot_rel * the column's max (FPLUS_PIVOT_REL_DEFAULT; 0: exact zeros only) */
+    int64_t relax_rows;         /* relaxed supernodes (32) */
+    int64_t panel;              /* panel width (512) */
+    int     use_gpu;            /* cuBLAS updates (0) */
+    double  gpu_min_flops;      /* (5e7) */
+    int     verbose;            /* (0) */
+} fplus_options;
+
+void fplus_default_options(fplus_options *opt);
+
+/* fplus_analyze with the options' pinning / postorder settings */
+int fplus_analyze_opts(int64_t n, const int64_t *Ap, const int64_t *Ai, const fplus_options *opt,
+                       fplus_symbolic **sym, char *err, size_t errlen);
+
+/* The factorization of the analysed pattern with values Ax (canonical CSC, the analysed pattern): diag(Dr) A[p,:][:,q] diag(Dc)
+ * = L U, with p, q, Dr, Dc in the original coordinates. */
+typedef struct fplus_numeric fplus_numeric;
+int fplus_factor(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                 const fplus_options *opt, fplus_numeric **num, char *err, size_t errlen);
+
+/* Solve in place for nrhs right-hand sides stored column-major in b (leading dimension ldb >= n), of the factor's type:
+ * trans 0: A x = b, 1: A^T x = b, 2: A^H x = b. */
+int fplus_solve(const fplus_numeric *num, void *b, int64_t nrhs, int64_t ldb, int trans, char *err, size_t errlen);
+
+const fplus_factors *fplus_numeric_factors(const fplus_numeric *num);   /* L, U of the scaled, permuted matrix */
+const int64_t *fplus_numeric_p(const fplus_numeric *num);              /* row order: A[p, :] */
+const int64_t *fplus_numeric_q(const fplus_numeric *num);              /* column order: A[:, q] */
+const double *fplus_numeric_Dr(const fplus_numeric *num);              /* row scaling, original row index */
+const double *fplus_numeric_Dc(const fplus_numeric *num);              /* column scaling, original column index */
+void fplus_numeric_free(fplus_numeric *num);
+
 #ifdef __cplusplus
 }
 #endif
