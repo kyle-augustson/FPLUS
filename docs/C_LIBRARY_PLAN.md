@@ -71,7 +71,9 @@ complex check), and the pytest suite passing.
 
 1. **Separate the C core from the Python API.** Split `_sparse_lu_c.c` into `src/`. The kernels return status codes and a message
    instead of raising, and fill plain structs instead of Python dicts. The existing extension becomes a wrapper over them; the build
-   stays setup.py for this phase.
+   stays setup.py for this phase. **Done:** `include/fplus.h` and `src/{factor_row,factor_sn,equil,solve,order}.c` have no Python API
+   calls, and `_sparse_lu_c.c` is the wrapper. The GIL release moved up from phase 3: two factorizations from two Python threads run
+   1.8x faster than one after the other. Factors are bit-identical to 266c55e on the 25,972-row pencil, and pytest passes 61/61.
 2. **Ordering in C.** Port dense-line pinning, the COLAMD call (linked `colamd_l`), the postorder and the permutation; add
    `fplus_analyze`. The Python ordering cache becomes a cache of symbolic handles.
 3. **CMake and packaging.** CMake for the library (BLAS vendor, OpenMP, SuiteSparse, GPU) and scikit-build-core for the extension.

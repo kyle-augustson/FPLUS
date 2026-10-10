@@ -78,8 +78,8 @@ else:
 
 ext = Extension(
     name="_sparse_lu_c",
-    sources=["_sparse_lu_c.c"],
-    include_dirs=[np.get_include()],
+    sources=["_sparse_lu_c.c", "src/factor_row.c", "src/factor_sn.c", "src/equil.c", "src/solve.c", "src/order.c"],
+    include_dirs=[np.get_include(), "include", "src"],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
     libraries=libraries,
