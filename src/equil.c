@@ -151,6 +151,7 @@ static int64_t ruiz_csc_iter(void *data, const int64_t *indices, const int64_t *
 int fplus_ruiz(int64_t n, const int64_t *indptr, const int64_t *indices, void *data, int is_complex, int is_csc,
                int max_iter, double tol, int verbose, double *Dr, double *Dc, char *err, size_t errlen)
 {
+    { int vrc = fplus_check_compressed(n, indptr, indices, 0, err, errlen); if (vrc != FPLUS_OK) return vrc; }
     int64_t nnz = indptr[n];
     double *row_max = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
     double *col_max = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));

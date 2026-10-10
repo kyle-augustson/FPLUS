@@ -95,6 +95,13 @@ except (ImportError, ValueError) as _e1:
     except ImportError as _e2:
         _HAVE_C_EXT = False
         _C_EXT_ERROR = f"{_e1}; {_e2}"
+# The C extension must be the build of this source: a stale .so (an older in-tree build, or another checkout's module on
+# sys.path) would otherwise run with this Python layer and silently route around the missing entry points (audit 2026-10-10).
+_C_API_VERSION = 2
+if _HAVE_C_EXT and getattr(_sparse_lu_c, "API_VERSION", 0) != _C_API_VERSION:
+    _C_EXT_ERROR = (f"_sparse_lu_c at {getattr(_sparse_lu_c, '__file__', '?')} has API_VERSION "
+                    f"{getattr(_sparse_lu_c, 'API_VERSION', 'none')}, this source needs {_C_API_VERSION} (a stale build: rebuild it)")
+    _HAVE_C_EXT = False
 if not _HAVE_C_EXT:
     # the pure-Python fallback is O(n^3) full pivoting: say so loudly (a mislinked extension, e.g. against the wrong
     # OpenMP runtime, otherwise drops a long factorisation into it without a word)
@@ -476,6 +483,8 @@ def lu_solve(
     dtype  = np.result_type(L.dtype, b)
     b      = np.asarray(b, dtype=dtype)
     n      = b.shape[0]
+    if b.ndim == 2:   # several right-hand sides: one at a time (the scalings broadcast along the rows)
+        return np.stack([lu_solve(L, U, p, q, b[:, k], Dr, Dc) for k in range(b.shape[1])], axis=1) if b.shape[1] else b.copy()
 
     b_perm = b[p]
     if Dr is not None:
@@ -838,13 +847,16 @@ def _colamd_ordering(A_csr: csr_matrix, n: int,
 # only, so a cached one is exact.  Repeated factorizations of one pattern (shift-invert at several shifts, a
 # rebuilt Dedalus pencil) skip COLAMD, which took 19 s of 89 s at n = 100k on a complex test pencil.
 _ORDER_CACHE: "OrderedDict" = None
+import threading as _threading
+_ORDER_CACHE_LOCK = _threading.Lock()
 _ORDER_CACHE_MAX = 8
 
 
 def clear_ordering_cache():
     """Forget every cached COLAMD ordering."""
     global _ORDER_CACHE
-    _ORDER_CACHE = None
+    with _ORDER_CACHE_LOCK:
+        _ORDER_CACHE = None
 
 
 def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask):
@@ -854,8 +866,8 @@ def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, t
     h.update(b"csc")
     h.update(np.ascontiguousarray(A_csr.indptr, dtype=np.int64).tobytes())
     h.update(np.ascontiguousarray(A_csr.indices, dtype=np.int64).tobytes())
-    for m in (tau_row_mask, tau_col_mask):
-        h.update(b"none" if m is None else np.packbits(np.asarray(m, dtype=bool)).tobytes())
+    for tag, m in ((b"row:", tau_row_mask), (b"col:", tau_col_mask)):   # tagged: the two masks cannot alias (audit 2026-10-10)
+        h.update(tag + (b"none" if m is None else np.packbits(np.asarray(m, dtype=bool)).tobytes()))
     return (n, A_csr.nnz, bool(pin_dense_rows), float(tau_density), int(tau_min_nnz), h.hexdigest())
 
 
@@ -865,17 +877,24 @@ def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row
     if not cache:
         return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
     from collections import OrderedDict
-    if _ORDER_CACHE is None:
-        _ORDER_CACHE = OrderedDict()
     key = (_pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask), bool(postorder))
-    hit = _ORDER_CACHE.get(key)
+    # the cache is shared by threads (the C core releases the GIL): look up and insert under the lock; the analysis itself runs
+    # outside it (two threads missing the same key may both analyse; the second insert is a no-op refresh)
+    with _ORDER_CACHE_LOCK:
+        if _ORDER_CACHE is None:
+            _ORDER_CACHE = OrderedDict()
+        hit = _ORDER_CACHE.get(key)
+        if hit is not None:
+            _ORDER_CACHE.move_to_end(key)
     if hit is None:
         hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
-        _ORDER_CACHE[key] = hit
-        while len(_ORDER_CACHE) > _ORDER_CACHE_MAX:
-            _ORDER_CACHE.popitem(last=False)
-    else:
-        _ORDER_CACHE.move_to_end(key)
+        with _ORDER_CACHE_LOCK:
+            if _ORDER_CACHE is None:
+                _ORDER_CACHE = OrderedDict()
+            _ORDER_CACHE[key] = hit
+            _ORDER_CACHE.move_to_end(key)
+            while len(_ORDER_CACHE) > _ORDER_CACHE_MAX:
+                _ORDER_CACHE.popitem(last=False)
     return hit[0].copy(), hit[1].copy(), hit[2], hit[3]
 
 
@@ -904,6 +923,8 @@ def _colamd_permutations_uncached(
     A_csr = _canonical_csc(A)        # (the name is historical: CSC, as the rest of the ordering)
     masks = []
     for name, m in (("tau_row_mask", tau_row_mask), ("tau_col_mask", tau_col_mask)):
+        if not pin_dense_rows:
+            m = None      # ignored without pinning, on both routes (audit 2026-10-10)
         if pin_dense_rows and m is not None:
             m = np.asarray(m, dtype=bool)
             if m.shape != (n,):
@@ -1064,7 +1085,7 @@ def _colamd_splu_fallback(A_struct: csr_matrix, n: int) -> np.ndarray:
 
     try:
         lu_struct = spla.splu(A_shifted, permc_spec="COLAMD")
-        return lu_struct.perm_c.astype(np.int64)
+        return np.argsort(lu_struct.perm_c).astype(np.int64)   # perm_c[i] = new position of column i; the order is its inverse (audit 2026-10-10)
     except Exception:
         return np.arange(n, dtype=np.int64)
 

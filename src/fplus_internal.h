@@ -125,4 +125,44 @@ static inline void *fplus_calloc_huge(size_t count, size_t size)
     return calloc(count > 0 ? count : 1, size);
 }
 
+/* Structure check of a compressed matrix (CSC: ptr over columns, idx = rows; CSR the same with roles swapped): n >= 0,
+ * ptr[0] == 0, ptr non-decreasing, every index in [0, n); canonical: indices strictly increasing within each line (sorted,
+ * no duplicates).  O(nnz).  Malformed input would otherwise index out of bounds (audit 2026-10-10). */
+static inline int fplus_check_compressed(int64_t n, const int64_t *ptr, const int64_t *idx, int canonical, char *err, size_t errlen)
+{
+    if (n < 0) { fplus_errf(err, errlen, "n must be >= 0 (got %ld)", (long)n); return FPLUS_ERR_BADARG; }
+    if (ptr[0] != 0) { fplus_errf(err, errlen, "indptr[0] must be 0 (got %ld)", (long)ptr[0]); return FPLUS_ERR_BADARG; }
+    for (int64_t j = 0; j < n; j++) {
+        if (ptr[j + 1] < ptr[j]) { fplus_errf(err, errlen, "indptr decreases at %ld", (long)j); return FPLUS_ERR_BADARG; }
+        for (int64_t q = ptr[j]; q < ptr[j + 1]; q++) {
+            if (idx[q] < 0 || idx[q] >= n) { fplus_errf(err, errlen, "index %ld out of range [0, %ld) in line %ld", (long)idx[q], (long)n, (long)j); return FPLUS_ERR_BADARG; }
+            if (canonical && q > ptr[j] && idx[q] <= idx[q - 1]) {
+                fplus_errf(err, errlen, "indices not strictly increasing in line %ld (canonical form required: sorted, no duplicates)", (long)j);
+                return FPLUS_ERR_BADARG;
+            }
+        }
+    }
+    return FPLUS_OK;
+}
+
+/* every value finite (NaN / Inf would pass the pivot search unnoticed and contaminate the factors) */
+static inline int fplus_check_finite(int64_t nnz, const void *x, int is_complex, char *err, size_t errlen)
+{
+    const double *d = (const double *)x;
+    const int64_t m = is_complex ? 2 * nnz : nnz;
+    for (int64_t k = 0; k < m; k++)
+        if (!isfinite(d[k])) { fplus_errf(err, errlen, "non-finite value in entry %ld", (long)(is_complex ? k / 2 : k)); return FPLUS_ERR_BADARG; }
+    return FPLUS_OK;
+}
+
+/* p is a permutation of 0..n-1 (work: n bytes, zeroed by the caller) */
+static inline int fplus_check_perm(int64_t n, const int64_t *p, unsigned char *seen, const char *name, char *err, size_t errlen)
+{
+    for (int64_t i = 0; i < n; i++) {
+        if (p[i] < 0 || p[i] >= n || seen[p[i]]) { fplus_errf(err, errlen, "%s is not a permutation of 0..n-1 (entry %ld)", name, (long)i); return FPLUS_ERR_BADARG; }
+        seen[p[i]] = 1;
+    }
+    return FPLUS_OK;
+}
+
 #endif /* FPLUS_INTERNAL_H */

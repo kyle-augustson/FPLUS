@@ -66,6 +66,7 @@ TRI_SOLVE_BODY(tri_solve_d, double, conj_d)
 int fplus_tri_solve(int64_t n, const int64_t *Lp, const int64_t *Li, const void *Lx, const int64_t *Up, const int64_t *Ui,
                     const void *Ux, void *x, int trans, int is_complex)
 {
+    if (trans < 0 || trans > 2 || n < 0) return FPLUS_ERR_BADARG;
     int rc = is_complex
         ? tri_solve_z(n, Lp, Li, (const double complex *)Lx, Up, Ui, (const double complex *)Ux, (double complex *)x, trans)
         : tri_solve_d(n, Lp, Li, (const double *)Lx, Up, Ui, (const double *)Ux, (double *)x, trans);

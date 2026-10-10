@@ -59,6 +59,15 @@ int fplus_factor_sn_perm(int64_t n, const int64_t *Ap, const int64_t *Ai, const 
                          fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen)
 {
     memset(out, 0, sizeof(*out));
+    {   /* canonical input and true permutations: the gather below indexes with both (audit 2026-10-10) */
+        int vrc = fplus_check_compressed(n, Ap, Ai, 1, err, errlen);
+        unsigned char *seen = vrc == FPLUS_OK ? (unsigned char *)calloc((size_t)(n > 0 ? n : 1), 1) : NULL;
+        if (vrc == FPLUS_OK && !seen) { fplus_errf(err, errlen, "out of memory"); return FPLUS_ERR_NOMEM; }
+        if (vrc == FPLUS_OK) vrc = fplus_check_perm(n, row_perm, seen, "row_perm", err, errlen);
+        if (vrc == FPLUS_OK) { memset(seen, 0, (size_t)(n > 0 ? n : 1)); vrc = fplus_check_perm(n, col_perm, seen, "col_perm", err, errlen); }
+        free(seen);
+        if (vrc != FPLUS_OK) return vrc;
+    }
     int64_t *Bp = NULL, *Bi = NULL; void *Bx = NULL;
     int rc = permute_csc(n, Ap, Ai, Ax, is_complex, row_perm, col_perm, &Bp, &Bi, &Bx);
     if (rc != FPLUS_OK) { fplus_errf(err, errlen, "out of memory"); return rc; }

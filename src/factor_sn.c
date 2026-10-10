@@ -451,7 +451,7 @@ typedef int (*cublasZgemm_t)(void *, int, int, int, int, int, const void *, cons
 typedef int (*cudaSync_t)(void);
 typedef int (*cudaAttr_t)(int *, int, int);
 typedef struct {
-    int ok; void *handle; cublasZgemm_t zgemm; cudaSync_t sync;
+    int ok; void *handle; cublasZgemm_t zgemm; cudaSync_t sync; int (*destroy)(void *);
     double min_flops, t, flops; int64_t calls;
 } GpuCtx;
 
@@ -474,6 +474,7 @@ static void gpu_init(GpuCtx *G, double min_flops, int verbose)
     G->sync = (cudaSync_t)dlsym(rt, "cudaDeviceSynchronize");
     cublasCreate_t create = (cublasCreate_t)dlsym(cb, "cublasCreate_v2");
     G->zgemm = (cublasZgemm_t)dlsym(cb, "cublasZgemm_v2");
+    G->destroy = (int (*)(void *))dlsym(cb, "cublasDestroy_v2");
     if (!attr || !G->sync || !create || !G->zgemm) { if (verbose >= 1) printf("[FPLUS] gpu: symbols missing; CPU only\n"); return; }
     int pageable = 0;
     if (attr(&pageable, 88 /* cudaDevAttrPageableMemoryAccess */, 0) != 0 || !pageable) {
@@ -626,7 +627,12 @@ static int sn_factor_panel_z(SnWork *W, const int64_t *Ap, const int64_t *Ai, co
                     if (G && G->ok && gfl >= G->min_flops) {
                         double tg = wall_time();
                         int st = G->zgemm(G->handle, 0, 0, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
-                        if (st != 0 || G->sync() != 0) { fplus_errf(W->err, W->errlen, "cuBLAS zgemm failed (status %d)", st); rc = FPLUS_ERR_GPU; goto out; }
+                        int se = st == 0 ? G->sync() : 0;
+                        if (st != 0 || se != 0) {
+                            if (st != 0) fplus_errf(W->err, W->errlen, "cuBLAS zgemm failed (status %d)", st);
+                            else fplus_errf(W->err, W->errlen, "CUDA device synchronize failed (error %d)", se);
+                            rc = FPLUS_ERR_GPU; goto out;
+                        }
                         G->t += wall_time() - tg; G->flops += gfl; G->calls++;
                     } else
                         cblas_zgemm(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
@@ -882,6 +888,9 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
 {
     memset(out, 0, sizeof(*out));
     if (!(pivot_rel >= 0.0)) { fplus_errf(err, errlen, "pivot_rel must be >= 0"); return FPLUS_ERR_BADARG; }
+    { int vrc = fplus_check_compressed(n, Ap, Ai, 0, err, errlen);
+      if (vrc == FPLUS_OK) vrc = fplus_check_finite(Ap[n], Ax, is_complex, err, errlen);
+      if (vrc != FPLUS_OK) return vrc; }
     int ret = FPLUS_ERR_NOMEM;
     double t_start = wall_time();
     size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
@@ -929,7 +938,8 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
     memset(&SNP, 0, sizeof(SNP)); SNP_last = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     for (int64_t i = 0; i < n; i++) SNP_last[i] = -5;
 #endif
-    const int64_t panel_w = panel > 1 ? panel : 1;
+    /* a panel wider than n is one panel of all n columns: cap it (the workspaces scale with it; audit 2026-10-10) */
+    const int64_t panel_w = panel > 1 ? (panel < (n > 1 ? n : 1) ? panel : (n > 1 ? n : 1)) : 1;
     int rc;
 #ifdef HAVE_BLAS
     GpuCtx G; memset(&G, 0, sizeof(G));
@@ -939,6 +949,7 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
         if (G.ok && verbose >= 1)
             printf("[FPLUS] gpu: %ld zgemm calls, %.3e flops, %.2f s (%.1f GF/s including synchronization)\n",
                    (long)G.calls, G.flops, G.t, G.t > 0 ? G.flops / G.t / 1e9 : 0.0);
+        if (G.ok && G.destroy) G.destroy(G.handle);   /* one handle per factorization: release it (audit 2026-10-10) */
     }
     else
 #endif

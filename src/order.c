@@ -93,7 +93,7 @@ int fplus_analyze(int64_t n, const int64_t *Ap, const int64_t *Ai, int pin_dense
                   fplus_symbolic **sym_out, char *err, size_t errlen)
 {
     *sym_out = NULL;
-    if (n < 0) { fplus_errf(err, errlen, "n must be >= 0"); return FPLUS_ERR_BADARG; }
+    { int vrc = fplus_check_compressed(n, Ap, Ai, 1, err, errlen); if (vrc != FPLUS_OK) return vrc; }
     const int64_t nnz = Ap[n];
     int ret = FPLUS_ERR_NOMEM;
     fplus_symbolic *sym = (fplus_symbolic *)calloc(1, sizeof(fplus_symbolic));

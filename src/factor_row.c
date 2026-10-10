@@ -33,6 +33,7 @@ static int sr_alloc(SparseRow *r, int64_t cap, int is_complex)
 
     if (!r->cols || (is_complex ? !r->vals_z : !r->vals_d)) {
         free(r->cols); free(r->vals_z); free(r->vals_d);
+        r->cols = NULL; r->vals_z = NULL; r->vals_d = NULL; r->cap = 0;   /* the caller's cleanup frees again (audit 2026-10-10) */
         return -1;
     }
     return 0;
@@ -1080,7 +1081,7 @@ static int assemble_csr_z(SparseRow * restrict rows, int64_t n, int upper,
         for (int64_t p = 0; p < rows[i].nnz; p++) {
             int64_t j = rows[i].cols[p];
             double complex v = rows[i].vals_z[p];
-            if (drop_tol > 0.0 && cabs(v) <= drop_tol) continue;
+            if (drop_tol > 0.0 && j != i && cabs(v) <= drop_tol) continue;   /* never drop the diagonal */
             if ( upper && j >= i) cnt++;
             if (!upper && j <  i) cnt++;
         }
@@ -1108,7 +1109,7 @@ static int assemble_csr_z(SparseRow * restrict rows, int64_t n, int upper,
         for (int64_t p = 0; p < rows[i].nnz; p++) {
             int64_t j = rows[i].cols[p];
             double complex v = rows[i].vals_z[p];
-            if (drop_tol > 0.0 && cabs(v) <= drop_tol) continue;
+            if (drop_tol > 0.0 && j != i && cabs(v) <= drop_tol) continue;   /* never drop the diagonal */
             if ( upper && j >= i) { indices[pos] = j; data[pos] = v; pos++; }
             if (!upper && j <  i) { indices[pos] = j; data[pos] = v; pos++; }
         }
@@ -1134,7 +1135,7 @@ static int assemble_csr_d(SparseRow * restrict rows, int64_t n, int upper,
         for (int64_t p = 0; p < rows[i].nnz; p++) {
             int64_t j = rows[i].cols[p];
             double v = rows[i].vals_d[p];
-            if (drop_tol > 0.0 && fabs(v) <= drop_tol) continue;
+            if (drop_tol > 0.0 && j != i && fabs(v) <= drop_tol) continue;   /* never drop the diagonal */
             if ( upper && j >= i) cnt++;
             if (!upper && j <  i) cnt++;
         }
@@ -1159,7 +1160,7 @@ static int assemble_csr_d(SparseRow * restrict rows, int64_t n, int upper,
         for (int64_t p = 0; p < rows[i].nnz; p++) {
             int64_t j = rows[i].cols[p];
             double v = rows[i].vals_d[p];
-            if (drop_tol > 0.0 && fabs(v) <= drop_tol) continue;
+            if (drop_tol > 0.0 && j != i && fabs(v) <= drop_tol) continue;   /* never drop the diagonal */
             if ( upper && j >= i) { indices[pos] = j; data[pos] = v; pos++; }
             if (!upper && j <  i) { indices[pos] = j; data[pos] = v; pos++; }
         }
@@ -1189,6 +1190,10 @@ int fplus_factor_row(int64_t n,
         return FPLUS_ERR_BADARG;
     }
     if (!(pivot_rel >= 0.0)) { fplus_errf(err, errlen, "pivot_rel must be >= 0"); return FPLUS_ERR_BADARG; }
+    if (!(drop_tol >= 0.0)) { fplus_errf(err, errlen, "drop_tol must be >= 0 (got %g)", drop_tol); return FPLUS_ERR_BADARG; }
+    { int vrc = fplus_check_compressed(n, in_indptr, in_indices, 1, err, errlen);   /* the row kernel needs sorted, unique rows */
+      if (vrc == FPLUS_OK) vrc = fplus_check_finite(in_indptr[n], in_data, is_complex, err, errlen);
+      if (vrc != FPLUS_OK) return vrc; }
     SparseRow *M   = NULL, *Lm  = NULL;
     int64_t   *p   = NULL, *q   = NULL;
     int64_t   *tmp_cols = NULL;
@@ -1336,7 +1341,13 @@ int fplus_factor_row(int64_t n,
         }
 
         if (k == 0) {
-            max_entry_k0   = best_abs_k;
+            /* relative to the largest |a_ij| of the input (for full pivoting the step-0 pivot itself); the step-0 pivot
+               of partial / rook pivoting is only a column maximum (audit 2026-10-10) */
+            max_entry_k0 = best_abs_k;
+            for (int64_t q = 0; q < in_indptr[n]; q++) {
+                double a = is_complex ? cabs(((const double complex *)in_data)[q]) : fabs(((const double *)in_data)[q]);
+                if (a > max_entry_k0) max_entry_k0 = a;
+            }
             pivot_threshold = pivot_rel * max_entry_k0;
         }
 

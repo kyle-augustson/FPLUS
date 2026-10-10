@@ -113,6 +113,37 @@ static PyObject *wrap_array(void *data, npy_intp len, int typenum)
     return arr;
 }
 
+/* Convert to a 1-D array of the given type, or NULL with an exception set.  Callers chain these with || so that no
+ * conversion runs while another's exception is pending (audit 2026-10-10). */
+static PyArrayObject *as_1d(PyObject *o, int type, int flags, const char *name)
+{
+    PyArrayObject *a = (PyArrayObject *)PyArray_FROM_OTF(o, type, flags);
+    if (!a) return NULL;
+    if (PyArray_NDIM(a) != 1) {
+        PyErr_Format(PyExc_ValueError, "%s must be 1-D (got %d dimensions)", name, PyArray_NDIM(a));
+        Py_DECREF(a);
+        return NULL;
+    }
+    return a;
+}
+
+/* indptr of length n + 1, and indices / data with at least indptr[n] entries; 0, or -1 with ValueError.  The core checks
+ * the contents (monotone indptr, indices in range). */
+static int check_compressed_lengths(int64_t n, PyArrayObject *ptr, PyArrayObject *idx, PyArrayObject *data, const char *fn)
+{
+    if (n < 0) { PyErr_Format(PyExc_ValueError, "%s: n must be >= 0", fn); return -1; }
+    if (PyArray_DIM(ptr, 0) != n + 1) {
+        PyErr_Format(PyExc_ValueError, "%s: indptr must have length n + 1 = %lld (got %lld)", fn, (long long)(n + 1), (long long)PyArray_DIM(ptr, 0));
+        return -1;
+    }
+    const int64_t nnz = ((const int64_t *)PyArray_DATA(ptr))[n];
+    if (nnz < 0 || PyArray_DIM(idx, 0) < nnz || (data && PyArray_DIM(data, 0) < nnz)) {
+        PyErr_Format(PyExc_ValueError, "%s: indices / data hold fewer than indptr[n] = %lld entries", fn, (long long)nnz);
+        return -1;
+    }
+    return 0;
+}
+
 static PyObject *raise_fplus(int rc, const char *err)
 {
     if (rc == FPLUS_ERR_NOMEM) return PyErr_NoMemory();
@@ -163,11 +194,13 @@ py_lu_factor(PyObject *self, PyObject *args)
                           &n_sst, &drop_tol, &is_complex, &verbose, &pivot_strategy, &pivot_rel))
         return NULL;
     int64_t n = (int64_t)n_sst;
-    PyArrayObject *data_arr = (PyArrayObject *)PyArray_FROM_OTF(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
-    if (!data_arr) return NULL;
-    PyArrayObject *idx_arr = (PyArrayObject *)PyArray_FROM_OTF(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *ptr_arr = (PyArrayObject *)PyArray_FROM_OTF(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    if (!idx_arr || !ptr_arr) { Py_DECREF(data_arr); Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); return NULL; }
+    PyArrayObject *data_arr = NULL, *idx_arr = NULL, *ptr_arr = NULL;
+    if (!(data_arr = as_1d(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY, "data"))
+            || !(idx_arr = as_1d(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indices"))
+            || !(ptr_arr = as_1d(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indptr"))
+            || check_compressed_lengths(n, ptr_arr, idx_arr, data_arr, "lu_factor")) {
+        Py_XDECREF(data_arr); Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); return NULL;
+    }
     fplus_factors f; char err[512] = {0}; int rc;
     Py_BEGIN_ALLOW_THREADS
     rc = fplus_factor_row(n, (const int64_t *)PyArray_DATA(ptr_arr), (const int64_t *)PyArray_DATA(idx_arr), PyArray_DATA(data_arr),
@@ -191,12 +224,14 @@ py_ruiz_equilibrate(PyObject *self, PyObject *args)
                           &n_sst, &max_iter, &tol, &is_complex, &verbose, &is_csc))
         return NULL;
     int64_t n = (int64_t)n_sst;
-    PyArrayObject *idx_arr = (PyArrayObject *)PyArray_FROM_OTF(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *ptr_arr = (PyArrayObject *)PyArray_FROM_OTF(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *idx_arr = NULL, *ptr_arr = NULL, *data_arr = NULL;
     /* the data are copied, so the scaling can work in place */
-    PyArrayObject *data_arr = (PyArrayObject *)PyArray_FROM_OTF(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64,
-                                                                NPY_ARRAY_ENSURECOPY | NPY_ARRAY_IN_ARRAY);
-    if (!idx_arr || !ptr_arr || !data_arr) { Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); Py_XDECREF(data_arr); return NULL; }
+    if (!(idx_arr = as_1d(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indices"))
+            || !(ptr_arr = as_1d(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indptr"))
+            || !(data_arr = as_1d(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_ENSURECOPY | NPY_ARRAY_IN_ARRAY, "data"))
+            || check_compressed_lengths(n, ptr_arr, idx_arr, data_arr, "ruiz_equilibrate")) {
+        Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); Py_XDECREF(data_arr); return NULL;
+    }
     double *Dr = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
     double *Dc = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
     if (!Dr || !Dc) { free(Dr); free(Dc); Py_DECREF(idx_arr); Py_DECREF(ptr_arr); Py_DECREF(data_arr); return PyErr_NoMemory(); }
@@ -227,11 +262,13 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
                           &n_sst, &is_complex, &verbose, &relax_rows, &panel, &use_gpu, &gpu_min_flops, &pivot_rel))
         return NULL;
     int64_t n = (int64_t)n_sst;
-    PyArrayObject *data_arr = (PyArrayObject *)PyArray_FROM_OTF(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
-    if (!data_arr) return NULL;
-    PyArrayObject *idx_arr = (PyArrayObject *)PyArray_FROM_OTF(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *ptr_arr = (PyArrayObject *)PyArray_FROM_OTF(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    if (!idx_arr || !ptr_arr) { Py_DECREF(data_arr); Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); return NULL; }
+    PyArrayObject *data_arr = NULL, *idx_arr = NULL, *ptr_arr = NULL;
+    if (!(data_arr = as_1d(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY, "data"))
+            || !(idx_arr = as_1d(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indices"))
+            || !(ptr_arr = as_1d(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indptr"))
+            || check_compressed_lengths(n, ptr_arr, idx_arr, data_arr, "lu_factor_sn")) {
+        Py_XDECREF(data_arr); Py_XDECREF(idx_arr); Py_XDECREF(ptr_arr); return NULL;
+    }
     fplus_factors f; char err[512] = {0}; int rc;
     Py_BEGIN_ALLOW_THREADS
     rc = fplus_factor_sn(n, (const int64_t *)PyArray_DATA(ptr_arr), (const int64_t *)PyArray_DATA(idx_arr), PyArray_DATA(data_arr),
@@ -251,18 +288,21 @@ py_lu_solve(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "OOOOOOOii", &Lp_o, &Li_o, &Lx_o, &Up_o, &Ui_o, &Ux_o, &b_o, &trans, &is_complex))
         return NULL;
     int vt = is_complex ? NPY_COMPLEX128 : NPY_FLOAT64;
-    PyArrayObject *Lp = (PyArrayObject *)PyArray_FROM_OTF(Lp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *Li = (PyArrayObject *)PyArray_FROM_OTF(Li_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *Lx = (PyArrayObject *)PyArray_FROM_OTF(Lx_o, vt, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *Up = (PyArrayObject *)PyArray_FROM_OTF(Up_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *Ui = (PyArrayObject *)PyArray_FROM_OTF(Ui_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *Ux = (PyArrayObject *)PyArray_FROM_OTF(Ux_o, vt, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *x  = (PyArrayObject *)PyArray_FROM_OTF(b_o, vt, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_ENSURECOPY);
+    PyArrayObject *Lp = NULL, *Li = NULL, *Lx = NULL, *Up = NULL, *Ui = NULL, *Ux = NULL, *x = NULL;
     PyObject *result = NULL;
-    if (!Lp || !Li || !Lx || !Up || !Ui || !Ux || !x) goto done;
+    if (!(Lp = as_1d(Lp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Lp")) || !(Li = as_1d(Li_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Li"))
+            || !(Lx = as_1d(Lx_o, vt, NPY_ARRAY_IN_ARRAY, "Lx")) || !(Up = as_1d(Up_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Up"))
+            || !(Ui = as_1d(Ui_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Ui")) || !(Ux = as_1d(Ux_o, vt, NPY_ARRAY_IN_ARRAY, "Ux"))
+            || !(x = as_1d(b_o, vt, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_ENSURECOPY, "b")))
+        goto done;
+    if (trans < 0 || trans > 2) { PyErr_SetString(PyExc_ValueError, "lu_solve: trans must be 0, 1 or 2"); goto done; }
     {
         int64_t n = PyArray_DIM(Lp, 0) - 1;
-        if (PyArray_NDIM(x) != 1 || PyArray_DIM(x, 0) != n) {
+        if (n < 0 || PyArray_DIM(Up, 0) != n + 1 || check_compressed_lengths(n, Lp, Li, Lx, "lu_solve (L)") || check_compressed_lengths(n, Up, Ui, Ux, "lu_solve (U)")) {
+            if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "lu_solve: Lp and Up must both have length n + 1");
+            goto done;
+        }
+        if (PyArray_DIM(x, 0) != n) {
             PyErr_SetString(PyExc_ValueError, "lu_solve: b must be a vector of length n");
             goto done;
         }
@@ -292,9 +332,12 @@ py_coletree_postorder(PyObject *self, PyObject *args)
     PyObject *ptr_o, *idx_o; Py_ssize_t m_s, n_s;
     if (!PyArg_ParseTuple(args, "OOnn", &ptr_o, &idx_o, &m_s, &n_s)) return NULL;
     int64_t m = (int64_t)m_s, n = (int64_t)n_s;
-    PyArrayObject *ptr_a = (PyArrayObject *)PyArray_FROM_OTF(ptr_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *idx_a = (PyArrayObject *)PyArray_FROM_OTF(idx_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    if (!ptr_a || !idx_a) { Py_XDECREF(ptr_a); Py_XDECREF(idx_a); return NULL; }
+    PyArrayObject *ptr_a = NULL, *idx_a = NULL;
+    if (m < 0 || !(ptr_a = as_1d(ptr_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indptr")) || !(idx_a = as_1d(idx_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indices"))
+            || check_compressed_lengths(n, ptr_a, idx_a, NULL, "coletree_postorder")) {
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "coletree_postorder: m must be >= 0");
+        Py_XDECREF(ptr_a); Py_XDECREF(idx_a); return NULL;
+    }
     npy_intp dn = (npy_intp)n;
     PyArrayObject *post_a = (PyArrayObject *)PyArray_SimpleNew(1, &dn, NPY_INT64);
     if (!post_a) { Py_DECREF(ptr_a); Py_DECREF(idx_a); return NULL; }
@@ -318,14 +361,16 @@ py_analyze(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "OOn|idLOOi", &ptr_o, &idx_o, &n_s, &pin_dense, &tau_density, &tau_min_nnz, &rmask_o, &cmask_o, &postorder))
         return NULL;
     int64_t n = (int64_t)n_s;
-    PyArrayObject *ptr_a = (PyArrayObject *)PyArray_FROM_OTF(ptr_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *idx_a = (PyArrayObject *)PyArray_FROM_OTF(idx_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *rm_a = rmask_o == Py_None ? NULL : (PyArrayObject *)PyArray_FROM_OTF(rmask_o, NPY_UINT8, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *cm_a = cmask_o == Py_None ? NULL : (PyArrayObject *)PyArray_FROM_OTF(cmask_o, NPY_UINT8, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *ptr_a = NULL, *idx_a = NULL, *rm_a = NULL, *cm_a = NULL;
     PyObject *result = NULL;
-    if (!ptr_a || !idx_a || (rmask_o != Py_None && !rm_a) || (cmask_o != Py_None && !cm_a)) goto done;
-    if (PyArray_DIM(ptr_a, 0) != n + 1 || (rm_a && PyArray_DIM(rm_a, 0) != n) || (cm_a && PyArray_DIM(cm_a, 0) != n)) {
-        PyErr_SetString(PyExc_ValueError, "analyze: indptr must have length n + 1 and the masks length n"); goto done;
+    if (!pin_dense) { rmask_o = Py_None; cmask_o = Py_None; }   /* masks are ignored without pinning (as the Python route) */
+    if (!(ptr_a = as_1d(ptr_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indptr")) || !(idx_a = as_1d(idx_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indices"))
+            || check_compressed_lengths(n, ptr_a, idx_a, NULL, "analyze")
+            || (rmask_o != Py_None && !(rm_a = as_1d(rmask_o, NPY_UINT8, NPY_ARRAY_IN_ARRAY, "row_mask")))
+            || (cmask_o != Py_None && !(cm_a = as_1d(cmask_o, NPY_UINT8, NPY_ARRAY_IN_ARRAY, "col_mask"))))
+        goto done;
+    if ((rm_a && PyArray_DIM(rm_a, 0) != n) || (cm_a && PyArray_DIM(cm_a, 0) != n)) {
+        PyErr_SetString(PyExc_ValueError, "analyze: the masks must have length n"); goto done;
     }
     {
         fplus_symbolic *sym = NULL; char err[512] = {0}; int rc;
@@ -365,19 +410,22 @@ py_factor_sn_perm(PyObject *self, PyObject *args)
                           &equilibrate, &ruiz_max_iter, &ruiz_tol, &verbose, &relax_rows, &panel, &use_gpu, &gpu_min_flops, &pivot_rel))
         return NULL;
     int64_t n = (int64_t)n_sst;
-    PyArrayObject *data_arr = (PyArrayObject *)PyArray_FROM_OTF(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *idx_arr = (PyArrayObject *)PyArray_FROM_OTF(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *ptr_arr = (PyArrayObject *)PyArray_FROM_OTF(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *rp_arr = (PyArrayObject *)PyArray_FROM_OTF(rp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject *cp_arr = (PyArrayObject *)PyArray_FROM_OTF(cp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY);
-    double *Dr = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
-    double *Dc = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    PyArrayObject *data_arr = NULL, *idx_arr = NULL, *ptr_arr = NULL, *rp_arr = NULL, *cp_arr = NULL;
+    double *Dr = NULL, *Dc = NULL;
     PyObject *result = NULL;
-    if (!data_arr || !idx_arr || !ptr_arr || !rp_arr || !cp_arr) goto done;
-    if (!Dr || !Dc) { PyErr_NoMemory(); goto done; }
-    if (PyArray_DIM(ptr_arr, 0) != n + 1 || PyArray_DIM(rp_arr, 0) != n || PyArray_DIM(cp_arr, 0) != n) {
-        PyErr_SetString(PyExc_ValueError, "factor_sn_perm: indptr must have length n + 1 and the permutations length n"); goto done;
+    if (!(data_arr = as_1d(data_obj, is_complex ? NPY_COMPLEX128 : NPY_FLOAT64, NPY_ARRAY_IN_ARRAY, "data"))
+            || !(idx_arr = as_1d(indices_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indices"))
+            || !(ptr_arr = as_1d(indptr_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY, "indptr"))
+            || !(rp_arr = as_1d(rp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "row_perm"))
+            || !(cp_arr = as_1d(cp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "col_perm"))
+            || check_compressed_lengths(n, ptr_arr, idx_arr, data_arr, "factor_sn_perm"))
+        goto done;
+    if (PyArray_DIM(rp_arr, 0) != n || PyArray_DIM(cp_arr, 0) != n) {
+        PyErr_SetString(PyExc_ValueError, "factor_sn_perm: the permutations must have length n"); goto done;
     }
+    Dr = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    Dc = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!Dr || !Dc) { PyErr_NoMemory(); goto done; }
     {
         fplus_factors f; char err[512] = {0}; int rc;
         Py_BEGIN_ALLOW_THREADS
@@ -462,5 +510,8 @@ PyMODINIT_FUNC
 PyInit__sparse_lu_c(void)
 {
     import_array();
-    return PyModule_Create(&moduledef);
+    PyObject *m = PyModule_Create(&moduledef);
+    /* the Python layer requires this version, so a stale build cannot silently stand in for the current one (audit 2026-10-10) */
+    if (m && PyModule_AddIntConstant(m, "API_VERSION", 2) != 0) { Py_DECREF(m); return NULL; }
+    return m;
 }

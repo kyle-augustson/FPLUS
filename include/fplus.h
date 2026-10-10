@@ -65,7 +65,8 @@ int fplus_ruiz(int64_t n, const int64_t *indptr, const int64_t *indices, void *d
                int max_iter, double tol, int verbose, double *Dr, double *Dc, char *err, size_t errlen);
 
 /* Triangular solves on CSC factors in place on x: trans 0 solves L U x = b, 1 (L U)^T x = b, 2 (L U)^H x = b.
- * L unit lower (an explicit unit diagonal is skipped), U upper with its diagonal stored. */
+ * L unit lower (an explicit unit diagonal is skipped), U upper with its diagonal stored.  The factors are trusted (they come
+ * from fplus_factor_*): no structure check here, it would cost a pass over L and U per solve. */
 int fplus_tri_solve(int64_t n, const int64_t *Lp, const int64_t *Li, const void *Lx, const int64_t *Up, const int64_t *Ui,
                     const void *Ux, void *x, int trans, int is_complex);
 
