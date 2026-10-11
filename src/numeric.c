@@ -7,6 +7,7 @@ struct fplus_numeric {
     int64_t n;
     int is_complex;
     fplus_factors f;            /* L, U of diag(Dr) A[p,:][:,q] diag(Dc) */
+    fplus_solve_plan *plan;     /* the blocked solves on f */
     int64_t *p, *q;             /* composed with the static orders: original coordinates */
     double *Dr, *Dc;            /* original coordinates */
 };
@@ -31,6 +32,7 @@ void fplus_numeric_free(fplus_numeric *num)
 {
     if (!num) return;
     fplus_factors_free(&num->f);
+    fplus_solve_plan_free(num->plan);
     free(num->p); free(num->q); free(num->Dr); free(num->Dc); free(num);
 }
 
@@ -74,9 +76,14 @@ int fplus_factor(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai
         num->Dc[cp[k]] = Dcp[k];             /* Dc_final = Dc[inv_col_perm] */
     }
     free(Drp); free(Dcp);
+    rc = fplus_solve_plan_create(n, num->f.Lp, num->f.Li, num->f.Up, num->f.Ui, &num->plan, err, errlen);
+    if (rc != FPLUS_OK) { fplus_numeric_free(num); return rc; }
     *out = num;
     return FPLUS_OK;
 }
+
+/* the right-hand sides go through the plan in groups: scaled and permuted into w (n x g), solved together, scattered back */
+#define SOLVE_GROUP 32
 
 int fplus_solve(const fplus_numeric *num, void *b, int64_t nrhs, int64_t ldb, int trans, char *err, size_t errlen)
 {
@@ -86,36 +93,40 @@ int fplus_solve(const fplus_numeric *num, void *b, int64_t nrhs, int64_t ldb, in
     const int64_t *p = num->p, *q = num->q;
     const double *Dr = num->Dr, *Dc = num->Dc;
     const size_t vs = num->is_complex ? sizeof(double complex) : sizeof(double);
-    void *w = malloc((size_t)(n > 0 ? n : 1) * vs);
+    const int64_t g = nrhs < SOLVE_GROUP ? nrhs : SOLVE_GROUP;
+    void *w = malloc((size_t)(n > 0 ? n : 1) * (size_t)(g > 0 ? g : 1) * vs);
     if (!w) { fplus_errf(err, errlen, "out of memory"); return FPLUS_ERR_NOMEM; }
     int rc = FPLUS_OK;
-    for (int64_t r = 0; r < nrhs && rc == FPLUS_OK; r++) {
-        if (num->is_complex) {
-            double complex *x = (double complex *)b + r * ldb, *ww = (double complex *)w;
-            if (trans == 0) {
-                for (int64_t k = 0; k < n; k++) ww[k] = Dr[p[k]] * x[p[k]];           /* b_perm = Dr[p] * b[p] */
-                rc = fplus_tri_solve(n, f->Lp, f->Li, f->Lx, f->Up, f->Ui, f->Ux, ww, 0, 1);
-                for (int64_t k = 0; k < n; k++) x[q[k]] = Dc[q[k]] * ww[k];           /* x[q] = Dc[q] * z */
+    for (int64_t r0 = 0; r0 < nrhs && rc == FPLUS_OK; r0 += g) {
+        const int64_t m = nrhs - r0 < g ? nrhs - r0 : g;
+        for (int64_t r = 0; r < m; r++) {
+            if (num->is_complex) {
+                const double complex *x = (const double complex *)b + (r0 + r) * ldb; double complex *ww = (double complex *)w + r * n;
+                if (trans == 0) for (int64_t k = 0; k < n; k++) ww[k] = Dr[p[k]] * x[p[k]];   /* b_perm = Dr[p] * b[p] */
+                else            for (int64_t k = 0; k < n; k++) ww[k] = Dc[q[k]] * x[q[k]];   /* rhs = Dc[q] * b[q] */
             } else {
-                for (int64_t k = 0; k < n; k++) ww[k] = Dc[q[k]] * x[q[k]];           /* rhs = Dc[q] * b[q] */
-                rc = fplus_tri_solve(n, f->Lp, f->Li, f->Lx, f->Up, f->Ui, f->Ux, ww, trans, 1);
-                for (int64_t k = 0; k < n; k++) x[p[k]] = Dr[p[k]] * ww[k];           /* x[p] = Dr[p] * w */
+                const double *x = (const double *)b + (r0 + r) * ldb; double *ww = (double *)w + r * n;
+                if (trans == 0) for (int64_t k = 0; k < n; k++) ww[k] = Dr[p[k]] * x[p[k]];
+                else            for (int64_t k = 0; k < n; k++) ww[k] = Dc[q[k]] * x[q[k]];
             }
-        } else {
-            double *x = (double *)b + r * ldb, *ww = (double *)w;
-            if (trans == 0) {
-                for (int64_t k = 0; k < n; k++) ww[k] = Dr[p[k]] * x[p[k]];
-                rc = fplus_tri_solve(n, f->Lp, f->Li, f->Lx, f->Up, f->Ui, f->Ux, ww, 0, 0);
-                for (int64_t k = 0; k < n; k++) x[q[k]] = Dc[q[k]] * ww[k];
+        }
+        rc = fplus_tri_solve_plan(num->plan, n, f->Lp, f->Li, f->Lx, f->Up, f->Ui, f->Ux, w, m, n, trans, num->is_complex);
+        if (rc != FPLUS_OK) break;
+        for (int64_t r = 0; r < m; r++) {
+            if (num->is_complex) {
+                double complex *x = (double complex *)b + (r0 + r) * ldb; const double complex *ww = (const double complex *)w + r * n;
+                if (trans == 0) for (int64_t k = 0; k < n; k++) x[q[k]] = Dc[q[k]] * ww[k];   /* x[q] = Dc[q] * z */
+                else            for (int64_t k = 0; k < n; k++) x[p[k]] = Dr[p[k]] * ww[k];   /* x[p] = Dr[p] * w */
             } else {
-                for (int64_t k = 0; k < n; k++) ww[k] = Dc[q[k]] * x[q[k]];
-                rc = fplus_tri_solve(n, f->Lp, f->Li, f->Lx, f->Up, f->Ui, f->Ux, ww, trans, 0);
-                for (int64_t k = 0; k < n; k++) x[p[k]] = Dr[p[k]] * ww[k];
+                double *x = (double *)b + (r0 + r) * ldb; const double *ww = (const double *)w + r * n;
+                if (trans == 0) for (int64_t k = 0; k < n; k++) x[q[k]] = Dc[q[k]] * ww[k];
+                else            for (int64_t k = 0; k < n; k++) x[p[k]] = Dr[p[k]] * ww[k];
             }
         }
     }
     free(w);
-    if (rc != FPLUS_OK) fplus_errf(err, errlen, "fplus_solve: zero or missing diagonal in U");
+    if (rc == FPLUS_ERR_SINGULAR) fplus_errf(err, errlen, "fplus_solve: zero or missing diagonal in U");
+    else if (rc != FPLUS_OK) fplus_errf(err, errlen, "fplus_solve: error %d", rc);
     return rc;
 }
 

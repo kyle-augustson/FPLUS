@@ -98,7 +98,7 @@ extra_link_args.extend([f"-L{ss_lib}", f"-Wl,-rpath,{ss_lib}"])
 
 ext = Extension(
     name="_sparse_lu_c",
-    sources=["_sparse_lu_c.c", "src/factor_row.c", "src/factor_sn.c", "src/equil.c", "src/solve.c", "src/order.c", "src/pipeline.c", "src/numeric.c"],
+    sources=["_sparse_lu_c.c", "src/factor_row.c", "src/factor_sn.c", "src/equil.c", "src/solve.c", "src/order.c", "src/pipeline.c", "src/numeric.c", "src/solve_plan.c"],
     include_dirs=[np.get_include(), "include", "src", ss_inc],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,

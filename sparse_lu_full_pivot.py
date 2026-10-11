@@ -97,7 +97,7 @@ except (ImportError, ValueError) as _e1:
         _C_EXT_ERROR = f"{_e1}; {_e2}"
 # The C extension must be the build of this source: a stale .so (an older in-tree build, or another checkout's module on
 # sys.path) would otherwise run with this Python layer and silently route around the missing entry points (audit 2026-10-10).
-_C_API_VERSION = 3   # 3: ILU drop-before-use and breakdown pivots (n_pivots_replaced)
+_C_API_VERSION = 4   # 3: ILU drop-before-use and breakdown pivots; 4: solve plans (solve_plan, lu_solve_plan)
 if _HAVE_C_EXT and getattr(_sparse_lu_c, "API_VERSION", 0) != _C_API_VERSION:
     _C_EXT_ERROR = (f"_sparse_lu_c at {getattr(_sparse_lu_c, '__file__', '?')} has API_VERSION "
                     f"{getattr(_sparse_lu_c, 'API_VERSION', 'none')}, this source needs {_C_API_VERSION} (a stale build: rebuild it)")
@@ -532,14 +532,25 @@ def _factor_arrays(F_csc):
             np.ascontiguousarray(F_csc.data))
 
 
-def _tri_solve_c(L_arrays, U_arrays, b, trans):
+def _tri_solve_c(L_arrays, U_arrays, b, trans, plan=None):
+    """The triangular sweeps in C; with a plan (_sparse_lu_c.solve_plan of these factors) the blocked, threaded solves,
+    which also take b of shape (n, nrhs)."""
     Lp, Li, Lx = L_arrays
     Up, Ui, Ux = U_arrays
     is_complex = np.iscomplexobj(Lx) or np.iscomplexobj(b)
     dt = np.complex128 if is_complex else np.float64
+    if plan is not None:
+        return _sparse_lu_c.lu_solve_plan(
+            plan, Lp, Li, np.ascontiguousarray(Lx, dtype=dt), Up, Ui, np.ascontiguousarray(Ux, dtype=dt),
+            np.asarray(b, dtype=dt), int(trans), int(is_complex))
     return _sparse_lu_c.lu_solve(
         Lp, Li, np.ascontiguousarray(Lx, dtype=dt), Up, Ui, np.ascontiguousarray(Ux, dtype=dt),
         np.ascontiguousarray(b, dtype=dt), int(trans), int(is_complex))
+
+
+def _rows_scaled(d, v):
+    """d * v for a vector v, d[:, None] * v for the columns of a matrix v"""
+    return d * v if v.ndim == 1 else d[:, None] * v
 
 
 def lu_residual(
@@ -632,6 +643,9 @@ class SparseLU:
         self._U  = U.tocsc()
         self._L_arrays = _factor_arrays(self._L)
         self._U_arrays = _factor_arrays(self._U)
+        # the blocked-solve plan (L supernodes, U row segments), once per factorization
+        self._plan = (_sparse_lu_c.solve_plan(self._L_arrays[0], self._L_arrays[1], self._U_arrays[0], self._U_arrays[1])
+                      if _HAVE_C_EXT and hasattr(_sparse_lu_c, "solve_plan") else None)
         self._p  = p
         self._q  = q
         self._Dr = Dr
@@ -685,8 +699,8 @@ class SparseLU:
         x : ndarray, same shape as b
         """
         b = np.asarray(b)
-        if b.ndim == 1:
-            return self._solve_single(b, trans)
+        if b.ndim == 1 or (b.ndim == 2 and self._plan is not None):
+            return self._solve_single(b, trans)     # with a plan, all columns of b in one blocked solve
         else:
             # Handle multiple RHS columns
             return np.column_stack(
@@ -701,10 +715,10 @@ class SparseLU:
                 b = np.asarray(b, dtype=dtype)
                 b_perm = b[self._p]
                 if self._Dr is not None:
-                    b_perm = self._Dr[self._p] * b_perm
-                z = _tri_solve_c(self._L_arrays, self._U_arrays, b_perm, 0)
-                x = np.empty(self._n, dtype=z.dtype)
-                x[self._q] = (self._Dc[self._q] * z) if self._Dc is not None else z
+                    b_perm = _rows_scaled(self._Dr[self._p], b_perm)
+                z = _tri_solve_c(self._L_arrays, self._U_arrays, b_perm, 0, self._plan)
+                x = np.empty(z.shape, dtype=z.dtype)
+                x[self._q] = _rows_scaled(self._Dc[self._q], z) if self._Dc is not None else z
                 return x
             return lu_solve(self._L, self._U, self._p, self._q,
                             b, self._Dr, self._Dc)
@@ -752,15 +766,15 @@ class SparseLU:
         # Steps 1-3: rhs = Dc[q] * b[q], then the transposed sweeps
         rhs = b[q].copy()
         if Dc is not None:
-            rhs = Dc[q] * rhs
+            rhs = _rows_scaled(Dc[q], rhs)
         if _HAVE_C_EXT and hasattr(_sparse_lu_c, "lu_solve"):
-            w = _tri_solve_c(self._L_arrays, self._U_arrays, rhs, 2 if conjugate else 1)
+            w = _tri_solve_c(self._L_arrays, self._U_arrays, rhs, 2 if conjugate else 1, self._plan)
         else:
             w = _tri_solve(self._L, self._U, rhs, 2 if conjugate else 1)
 
         # Step 4: z = Dr[p] * w
         if Dr is not None:
-            w = Dr[p] * w
+            w = _rows_scaled(Dr[p], w)
 
         # Step 5: x = z[inv_p]
         inv_p = np.empty(n, dtype=np.int64)

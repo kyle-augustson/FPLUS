@@ -71,6 +71,21 @@ int fplus_ruiz(int64_t n, const int64_t *indptr, const int64_t *indices, void *d
 int fplus_tri_solve(int64_t n, const int64_t *Lp, const int64_t *Li, const void *Lx, const int64_t *Up, const int64_t *Ui,
                     const void *Ux, void *x, int trans, int is_complex);
 
+/* ---- solve plans: blocked triangular solves, threaded inside large supernodes, several right-hand sides at once ----
+ * A plan is built once per factorization from the CSC patterns (fplus_factor_* output, or any CSC factors with the unit
+ * diagonal stored first in every L column); fplus_tri_solve_plan then solves for nrhs right-hand sides stored column-major
+ * in x (leading dimension ldx >= n), in place, with the same factor arrays.  The solves with trans 0 are bit-identical to
+ * fplus_tri_solve at any thread count; the transposed solves agree with it to round-off.  Factors without the supernodal
+ * layout fall back to fplus_tri_solve per right-hand side. */
+typedef struct fplus_solve_plan fplus_solve_plan;
+int fplus_solve_plan_create(int64_t n, const int64_t *Lp, const int64_t *Li, const int64_t *Up, const int64_t *Ui,
+                            fplus_solve_plan **plan, char *err, size_t errlen);
+int fplus_tri_solve_plan(const fplus_solve_plan *plan, int64_t n, const int64_t *Lp, const int64_t *Li, const void *Lx,
+                         const int64_t *Up, const int64_t *Ui, const void *Ux, void *x, int64_t nrhs, int64_t ldx,
+                         int trans, int is_complex);
+int64_t fplus_solve_plan_nsupernodes(const fplus_solve_plan *plan);   /* L supernodes found, -1 for the fallback */
+void fplus_solve_plan_free(fplus_solve_plan *plan);
+
 /* Postorder of the column elimination tree of the m x n CSC pattern (SuperLU's sp_coletree + TreePostorder):
  * post[k] = the column placed k-th. */
 int fplus_coletree_postorder(int64_t m, int64_t n, const int64_t *Ap, const int64_t *Ai, int64_t *post);

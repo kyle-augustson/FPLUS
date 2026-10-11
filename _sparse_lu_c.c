@@ -284,6 +284,95 @@ py_lu_factor_sn(PyObject *self, PyObject *args)
     return factors_to_dict(&f);
 }
 
+/* ---- solve plans (a PyCapsule owning an fplus_solve_plan) ---- */
+static void plan_capsule_free(PyObject *cap)
+{
+    fplus_solve_plan_free((fplus_solve_plan *)PyCapsule_GetPointer(cap, "fplus_solve_plan"));
+}
+
+static PyObject *
+py_solve_plan(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *Lp_o, *Li_o, *Up_o, *Ui_o;
+    if (!PyArg_ParseTuple(args, "OOOO", &Lp_o, &Li_o, &Up_o, &Ui_o)) return NULL;
+    PyArrayObject *Lp = NULL, *Li = NULL, *Up = NULL, *Ui = NULL;
+    PyObject *result = NULL;
+    if (!(Lp = as_1d(Lp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Lp")) || !(Li = as_1d(Li_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Li"))
+            || !(Up = as_1d(Up_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Up")) || !(Ui = as_1d(Ui_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Ui")))
+        goto done;
+    {
+        int64_t n = PyArray_DIM(Lp, 0) - 1;
+        if (check_compressed_lengths(n, Lp, Li, NULL, "solve_plan (L)") || check_compressed_lengths(n, Up, Ui, NULL, "solve_plan (U)"))
+            goto done;
+        fplus_solve_plan *pl = NULL;
+        char err[256] = {0};
+        int rc;
+        Py_BEGIN_ALLOW_THREADS
+        rc = fplus_solve_plan_create(n, (const int64_t *)PyArray_DATA(Lp), (const int64_t *)PyArray_DATA(Li),
+                                     (const int64_t *)PyArray_DATA(Up), (const int64_t *)PyArray_DATA(Ui), &pl, err, sizeof(err));
+        Py_END_ALLOW_THREADS
+        if (rc != FPLUS_OK) { raise_fplus(rc, err); goto done; }
+        result = PyCapsule_New(pl, "fplus_solve_plan", plan_capsule_free);
+        if (!result) fplus_solve_plan_free(pl);
+    }
+done:
+    Py_XDECREF(Lp); Py_XDECREF(Li); Py_XDECREF(Up); Py_XDECREF(Ui);
+    return result;
+}
+
+static PyObject *
+py_lu_solve_plan(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *cap, *Lp_o, *Li_o, *Lx_o, *Up_o, *Ui_o, *Ux_o, *b_o;
+    int trans, is_complex;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOii", &cap, &Lp_o, &Li_o, &Lx_o, &Up_o, &Ui_o, &Ux_o, &b_o, &trans, &is_complex))
+        return NULL;
+    const fplus_solve_plan *pl = (const fplus_solve_plan *)PyCapsule_GetPointer(cap, "fplus_solve_plan");
+    if (!pl) return NULL;
+    int vt = is_complex ? NPY_COMPLEX128 : NPY_FLOAT64;
+    PyArrayObject *Lp = NULL, *Li = NULL, *Lx = NULL, *Up = NULL, *Ui = NULL, *Ux = NULL, *x = NULL;
+    PyObject *result = NULL;
+    if (!(Lp = as_1d(Lp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Lp")) || !(Li = as_1d(Li_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Li"))
+            || !(Lx = as_1d(Lx_o, vt, NPY_ARRAY_IN_ARRAY, "Lx")) || !(Up = as_1d(Up_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Up"))
+            || !(Ui = as_1d(Ui_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Ui")) || !(Ux = as_1d(Ux_o, vt, NPY_ARRAY_IN_ARRAY, "Ux")))
+        goto done;
+    /* b: (n,) or (n, nrhs), copied column-major */
+    x = (PyArrayObject *)PyArray_FROM_OTF(b_o, vt, NPY_ARRAY_F_CONTIGUOUS | NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE | NPY_ARRAY_ENSURECOPY);
+    if (!x) goto done;
+    if (trans < 0 || trans > 2) { PyErr_SetString(PyExc_ValueError, "lu_solve_plan: trans must be 0, 1 or 2"); goto done; }
+    {
+        int64_t n = PyArray_DIM(Lp, 0) - 1;
+        if (n < 0 || PyArray_DIM(Up, 0) != n + 1 || check_compressed_lengths(n, Lp, Li, Lx, "lu_solve_plan (L)")
+                || check_compressed_lengths(n, Up, Ui, Ux, "lu_solve_plan (U)")) {
+            if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "lu_solve_plan: Lp and Up must both have length n + 1");
+            goto done;
+        }
+        int nd = PyArray_NDIM(x);
+        if ((nd != 1 && nd != 2) || PyArray_DIM(x, 0) != n) {
+            PyErr_SetString(PyExc_ValueError, "lu_solve_plan: b must have shape (n,) or (n, nrhs)");
+            goto done;
+        }
+        int64_t nrhs = nd == 2 ? PyArray_DIM(x, 1) : 1;
+        int rc;
+        Py_BEGIN_ALLOW_THREADS
+        rc = fplus_tri_solve_plan(pl, n, (const int64_t *)PyArray_DATA(Lp), (const int64_t *)PyArray_DATA(Li), PyArray_DATA(Lx),
+                                  (const int64_t *)PyArray_DATA(Up), (const int64_t *)PyArray_DATA(Ui), PyArray_DATA(Ux),
+                                  PyArray_DATA(x), nrhs, n, trans, is_complex);
+        Py_END_ALLOW_THREADS
+        if (rc == FPLUS_ERR_SINGULAR) { PyErr_SetString(PyExc_RuntimeError, "lu_solve_plan: zero or missing diagonal in U"); goto done; }
+        if (rc == FPLUS_ERR_BADARG) { PyErr_SetString(PyExc_ValueError, "lu_solve_plan: the plan does not match these factors"); goto done; }
+        if (rc != FPLUS_OK) { raise_fplus(rc, "lu_solve_plan failed"); goto done; }
+        result = (PyObject *)x;
+        Py_INCREF(result);
+    }
+done:
+    Py_XDECREF(Lp); Py_XDECREF(Li); Py_XDECREF(Lx); Py_XDECREF(Up); Py_XDECREF(Ui); Py_XDECREF(Ux);
+    Py_XDECREF(x);
+    return result;
+}
+
 static PyObject *
 py_lu_solve(PyObject *self, PyObject *args)
 {
@@ -499,6 +588,19 @@ static PyMethodDef SparseLUMethods[] = {
      "Triangular solves on CSC factors: trans 0 solves L U x = b, 1 solves\n"
      "(L U)^T x = b, 2 solves (L U)^H x = b.\n"
     },
+    {"solve_plan", py_solve_plan, METH_VARARGS,
+     "solve_plan(Lp, Li, Up, Ui) -> plan\n"
+     "\n"
+     "The blocked-solve plan of CSC factors (L supernodes, U row segments),\n"
+     "for lu_solve_plan with the same factor arrays.\n"
+    },
+    {"lu_solve_plan", py_lu_solve_plan, METH_VARARGS,
+     "lu_solve_plan(plan, Lp, Li, Lx, Up, Ui, Ux, b, trans, is_complex) -> x\n"
+     "\n"
+     "lu_solve with a plan: b of shape (n,) or (n, nrhs), the right-hand sides\n"
+     "solved together, threaded inside large supernodes; trans 0 bit-identical\n"
+     "to lu_solve.\n"
+    },
     {NULL, NULL, 0, NULL}
 };
 
@@ -517,6 +619,6 @@ PyInit__sparse_lu_c(void)
     import_array();
     PyObject *m = PyModule_Create(&moduledef);
     /* the Python layer requires this version, so a stale build cannot silently stand in for the current one (audit 2026-10-10) */
-    if (m && PyModule_AddIntConstant(m, "API_VERSION", 3) != 0) { Py_DECREF(m); return NULL; }
+    if (m && PyModule_AddIntConstant(m, "API_VERSION", 4) != 0) { Py_DECREF(m); return NULL; }
     return m;
 }

@@ -72,7 +72,7 @@ if(FPLUS_OPENMP)
 endif()
 
 # ---------------------------------------------------------------------------- the core
-set(FPLUS_SOURCES src/factor_row.c src/factor_sn.c src/equil.c src/solve.c src/order.c src/pipeline.c src/numeric.c)
+set(FPLUS_SOURCES src/factor_row.c src/factor_sn.c src/equil.c src/solve.c src/order.c src/pipeline.c src/numeric.c src/solve_plan.c)
 add_library(fplus_core OBJECT ${FPLUS_SOURCES})
 set_target_properties(fplus_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(fplus_core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> PRIVATE src)

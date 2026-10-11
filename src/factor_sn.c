@@ -47,6 +47,14 @@ static int gp_grow(int64_t **idx, void **val, int64_t *cap, int64_t need, int is
  * entries in A.
  * ========================================================================= */
 
+typedef struct { int64_t row, rr; } RowOrd;     /* output row index, block row */
+
+static int roword_cmp(const void *a, const void *b)
+{
+    int64_t x = ((const RowOrd *)a)->row, y = ((const RowOrd *)b)->row;
+    return (x > y) - (x < y);
+}
+
 typedef struct {
     int64_t first;      /* first column */
     int64_t ncols;      /* columns stored so far */
@@ -996,23 +1004,41 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
         Lx = malloc((size_t)nnzL * vs);
         q = (int64_t *)malloc((size_t)n * sizeof(int64_t));
         if (!Lp || !Li || !Lx || !q) { ret = FPLUS_ERR_NOMEM; fplus_errf(err, errlen, "out of memory"); goto done; }
+        /* the rows below a supernode's pivot rows go out in ascending (pivot-order) row index, the same order in each of
+         * its columns: the blocked solves (solve_plan.c) then split them across threads without two threads writing one
+         * cache line of the solution */
+        int64_t maxrest = 0;
+        for (int64_t s = 0; s < W.nsn; s++) if (W.sn[s].nrows - W.sn[s].ncols > maxrest) maxrest = W.sn[s].nrows - W.sn[s].ncols;
+        RowOrd *ord = (RowOrd *)malloc((size_t)(maxrest > 0 ? maxrest : 1) * sizeof(RowOrd));
+        if (!ord) { ret = FPLUS_ERR_NOMEM; fplus_errf(err, errlen, "out of memory"); goto done; }
         int64_t o = 0;
         for (int64_t s = 0; s < W.nsn; s++) {
             Supernode *S = &W.sn[s];
+            const int64_t nrest = S->nrows - S->ncols;
+            for (int64_t t = 0; t < nrest; t++) { ord[t].row = W.pinv[S->rows[S->ncols + t]]; ord[t].rr = S->ncols + t; }
+            qsort(ord, (size_t)nrest, sizeof(RowOrd), roword_cmp);
             for (int64_t cc = 0; cc < S->ncols; cc++) {
                 int64_t j = S->first + cc;
                 Lp[j] = o;
                 Li[o] = j;
                 if (is_complex) ((double complex *)Lx)[o] = 1.0; else ((double *)Lx)[o] = 1.0;
                 o++;
-                for (int64_t rr = cc + 1; rr < S->nrows; rr++) {
+                for (int64_t rr = cc + 1; rr < S->ncols; rr++) {      /* the pivot rows of the supernode: ascending already */
                     Li[o] = W.pinv[S->rows[rr]];
+                    if (is_complex) ((double complex *)Lx)[o] = ((double complex *)S->blk)[cc * S->ld + rr];
+                    else            ((double *)Lx)[o] = ((double *)S->blk)[cc * S->ld + rr];
+                    o++;
+                }
+                for (int64_t t = 0; t < nrest; t++) {
+                    const int64_t rr = ord[t].rr;
+                    Li[o] = ord[t].row;
                     if (is_complex) ((double complex *)Lx)[o] = ((double complex *)S->blk)[cc * S->ld + rr];
                     else            ((double *)Lx)[o] = ((double *)S->blk)[cc * S->ld + rr];
                     o++;
                 }
             }
         }
+        free(ord);
         Lp[n] = o;
         for (int64_t i = 0; i < n; i++) q[i] = i;
         int64_t *nui = (int64_t *)realloc(W.Ui, (size_t)(W.nnzU > 0 ? W.nnzU : 1) * sizeof(int64_t));
