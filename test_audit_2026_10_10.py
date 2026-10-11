@@ -237,15 +237,17 @@ def test_cache_concurrent_threads():
 
 # ---------------------------------------------------------------- row kernel: drop_tol filters computed values only
 def _drop_block(npad, cplx):
-    """A 3x3 block whose row 1 holds a12 = 5e-3 < drop_tol that the update from row 0 does not touch but that feeds U22 = 4 - 0.5 a12
-    on the next step; npad padding columns on rows 0 and 1 push the row-0 update onto the BLAS axpy path without changing the
-    block's arithmetic.  Dominant pivots (8, 6, then U22) with padding diagonals 1, so every strategy picks the same order."""
-    n = 3 + 2 * npad
+    """Row 2 holds a23 = 5e-3 < drop_tol, untouched by the row-0 update but then updated by row 1 (U13 = 1, multiplier 0.5) to
+    -0.495 before row 2 becomes a pivot row, so U23 = -0.495.  npad padding columns on rows 0 and 2 push the row-0 update
+    onto the BLAS axpy path, which used to drop the untouched a23 early (U23 = -0.5).  Pivots 8, 6, 4 against a33 = 2 and
+    padding diagonals 1, so every strategy picks the same order."""
+    n = 4 + 2 * npad
     A = sp.lil_matrix((n, n), dtype=complex if cplx else float)
-    A[0, 0] = 8; A[1, 0] = 4; A[1, 1] = 6; A[1, 2] = 5e-3; A[2, 1] = 3; A[2, 2] = 4
+    A[0, 0] = 8; A[1, 1] = 6; A[1, 3] = 1
+    A[2, 0] = 4; A[2, 1] = 3; A[2, 2] = 4; A[2, 3] = 5e-3; A[3, 3] = 2
     for t in range(npad):
-        A[0, 3 + t] = 1; A[1, 3 + npad + t] = 1
-    for j in range(3, n):
+        A[0, 4 + t] = 1; A[2, 4 + npad + t] = 1
+    for j in range(4, n):
         A[j, j] = 1
     return A.tocsr()
 
@@ -257,5 +259,37 @@ def test_row_kernel_drop_independent_of_axpy_path(cplx, strategy):
         L, U, p, q, Dr, Dc = sparse_lu_full_pivot(_drop_block(npad, cplx), drop_tol=1e-2, equilibrate=False, colamd=False,
                                                   pivot_strategy=strategy)
         U = U.tocsr()
-        k2 = int(np.where(p == 2)[0][0]); c2 = int(np.where(q == 2)[0][0])
-        assert abs(U[k2, c2] - 3.9975) < 1e-12, (npad, U[k2, c2])
+        k2 = int(np.where(p == 2)[0][0]); c3 = int(np.where(q == 3)[0][0])
+        assert abs(U[k2, c3] - (-0.495)) < 1e-12, (npad, U[k2, c3])
+
+
+def test_ilu_drops_small_pivot_row_entries_before_use():
+    """ILUT's drop-before-use: a small entry of a pivot row (|a12| <= drop_tol) is dropped before row 1 updates row 2,
+    so it neither appears in U nor reaches U22 (C kernel and Python reference alike)."""
+    A = sp.csr_matrix(np.array([[8, 0, 0], [4, 6, 5e-3], [0, 3, 4]], dtype=float))
+    for use_c in (True, False):
+        have = M._HAVE_C_EXT; M._HAVE_C_EXT = have and use_c
+        try:
+            L, U, p, q, Dr, Dc = sparse_lu_full_pivot(A, drop_tol=1e-2, equilibrate=False, colamd=False, pivot_strategy="full")
+        finally:
+            M._HAVE_C_EXT = have
+        U = U.toarray()
+        assert U[1, 2] == 0 and U[2, 2] == 4.0, (use_c, U)
+
+
+def test_ilu_breakdown_replaces_pivot():
+    """[[1, 1], [1, 1.0005]] with drop_tol 1e-2: after the first step the remaining entry 5e-4 is dropped, leaving no
+    pivot; the pivot becomes drop_tol * max|a_ij| = 0.010005, with a RuntimeWarning (C kernel and Python reference)."""
+    A = sp.csr_matrix(np.array([[1.0, 1.0], [1.0, 1.0005]]))
+    for use_c in (True, False):
+        have = M._HAVE_C_EXT; M._HAVE_C_EXT = have and use_c
+        try:
+            with pytest.warns(RuntimeWarning, match="ILU breakdown: 1 "):
+                L, U, p, q, Dr, Dc = sparse_lu_full_pivot(A, drop_tol=1e-2, equilibrate=False, colamd=False,
+                                                          pivot_strategy="full")
+        finally:
+            M._HAVE_C_EXT = have
+        assert abs(U.toarray()[1, 1] - 0.010005) < 1e-15, (use_c, U.toarray())
+    with pytest.raises(RuntimeError, match="(?i)singular"):         # exact LU of a singular matrix still fails
+        sparse_lu_full_pivot(sp.csr_matrix(np.array([[1.0, 1.0], [1.0, 1.0]])), equilibrate=False, colamd=False,
+                             pivot_strategy="full")

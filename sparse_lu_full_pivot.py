@@ -97,7 +97,7 @@ except (ImportError, ValueError) as _e1:
         _C_EXT_ERROR = f"{_e1}; {_e2}"
 # The C extension must be the build of this source: a stale .so (an older in-tree build, or another checkout's module on
 # sys.path) would otherwise run with this Python layer and silently route around the missing entry points (audit 2026-10-10).
-_C_API_VERSION = 2
+_C_API_VERSION = 3   # 3: ILU drop-before-use and breakdown pivots (n_pivots_replaced)
 if _HAVE_C_EXT and getattr(_sparse_lu_c, "API_VERSION", 0) != _C_API_VERSION:
     _C_EXT_ERROR = (f"_sparse_lu_c at {getattr(_sparse_lu_c, '__file__', '?')} has API_VERSION "
                     f"{getattr(_sparse_lu_c, 'API_VERSION', 'none')}, this source needs {_C_API_VERSION} (a stale build: rebuild it)")
@@ -167,7 +167,17 @@ def sparse_lu_full_pivot(
         General, possibly nonsymmetric, complex or real square matrix.
 
     drop_tol : float, optional
-        ILU drop tolerance.  Default 0 = exact factorisation.
+        Default 0: the exact factorisation.  ``drop_tol > 0``: an incomplete
+        LU (threshold ILU, row kernel, any ``pivot_strategy``) for use as a
+        preconditioner.  On the equilibrated, ordered matrix it drops, as they
+        arise, every multiplier and updated / fill value with
+        ``|v| <= drop_tol``, and when a row becomes a pivot row (row k of U)
+        its off-pivot entries with ``|v| <= drop_tol`` before it updates the
+        rows below; pivots are never dropped.  With Ruiz equilibration the
+        entries are O(1), so ``drop_tol`` acts as a relative threshold.  If
+        dropping leaves no pivot (the exact factorisation's trailing pivots are
+        at or below ``drop_tol``), the pivot is replaced by
+        ``drop_tol * max|a_ij|`` as in SuperLU's ILU, with a RuntimeWarning.
 
     equilibrate : bool, optional
         Apply Ruiz iterative L-inf equilibration before factorisation.
@@ -1162,6 +1172,12 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
             int(verbose), int(pivot_code), pivot_rel
         )
         fmt = csr_matrix
+        if raw.get("n_pivots_replaced", 0) > 0:
+            import warnings
+            warnings.warn(
+                f"ILU breakdown: {raw['n_pivots_replaced']} zero or negligible pivots replaced by drop_tol * max|a_ij| "
+                f"(the exact factorization's trailing pivots are at or below drop_tol={drop_tol:g}); the factors are a "
+                "preconditioner of reduced quality", RuntimeWarning, stacklevel=3)
 
     L = fmt(
         (raw["L_data"], raw["L_indices"], raw["L_indptr"]),
@@ -1270,6 +1286,7 @@ def _lu_factor_py(A, n, drop_tol, equilibrate, dtype):
     _eps       = np.finfo(target_dtype).eps
     _pivot_tol = np.sqrt(_eps)
     _max_entry = 0.0
+    n_replaced = 0
 
     for k in range(n):
         best_val = -1.0; pi = -1; pj = -1
@@ -1279,11 +1296,15 @@ def _lu_factor_py(A, n, drop_tol, equilibrate, dtype):
                 av = abs(v)
                 if av > best_val:
                     best_val = av; pi = i; pj = j
+        if k == 0:
+            _max_entry = max(best_val, 0.0)
+        if (pi == -1 or best_val < _pivot_tol * _max_entry or best_val == 0.0) and drop_tol > 0.0 and drop_tol * _max_entry > 0.0:
+            # ILU breakdown (as the C kernel): replace the pivot at (k, k) by drop_tol * max|a_ij|, no swap
+            M[k][k] = target_dtype(drop_tol * _max_entry); pi = k; pj = k; best_val = drop_tol * _max_entry
+            n_replaced += 1
         if pi == -1 or best_val == 0.0:
             raise RuntimeError(
                 f"Zero pivot at step {k}. Matrix is singular.")
-        if k == 0:
-            _max_entry = best_val
         if best_val < _pivot_tol * _max_entry:
             raise RuntimeError(
                 f"Near-zero pivot {best_val:.2e} at step {k} "
@@ -1307,6 +1328,9 @@ def _lu_factor_py(A, n, drop_tol, equilibrate, dtype):
         if pivot_val == 0.0:
             raise RuntimeError(
                 f"Zero pivot at step {k}. Matrix is singular.")
+        if drop_tol > 0.0:
+            # ILU: row k is final (row k of U); drop its small off-pivot entries before it updates the rows below
+            M[k] = {j: v for j, v in M[k].items() if j == k or abs(v) > drop_tol}
 
         pk_items = list(M[k].items())
         for i in range(k+1, n):
@@ -1335,7 +1359,7 @@ def _lu_factor_py(A, n, drop_tol, equilibrate, dtype):
             if not upper:
                 row_entries.append((i, target_dtype(1)))
             for j, v in rows[i].items():
-                if drop_tol > 0.0 and abs(v) <= drop_tol: continue
+                if drop_tol > 0.0 and j != i and abs(v) <= drop_tol: continue   # never drop the diagonal (as the C kernel)
                 if upper     and j >= i: row_entries.append((j, v))
                 if not upper and j <  i: row_entries.append((j, v))
             row_entries.sort(key=lambda x: x[0])
@@ -1351,4 +1375,10 @@ def _lu_factor_py(A, n, drop_tol, equilibrate, dtype):
 
     L = _dod_to_csr(Lm, n, False)
     U = _dod_to_csr(M,  n, True)
+    if n_replaced > 0:
+        import warnings
+        warnings.warn(
+            f"ILU breakdown: {n_replaced} zero or negligible pivots replaced by drop_tol * max|a_ij| "
+            f"(the exact factorization's trailing pivots are at or below drop_tol={drop_tol:g}); the factors are a "
+            "preconditioner of reduced quality", RuntimeWarning, stacklevel=3)
     return L, U, p, q, Dr, Dc

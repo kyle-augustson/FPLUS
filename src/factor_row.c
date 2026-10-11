@@ -1219,6 +1219,7 @@ int fplus_factor_row(int64_t n,
 
     /* Verbose-mode timing and progress. */
     double t_start = (verbose >= 1) ? wall_time() : 0.0;
+    int64_t n_replaced = 0;   /* ILU: pivots replaced at a breakdown (step 1b) */
     /* Print every max(1, n/20) steps when verbose >= 2, capped at 1000. */
     int64_t print_stride = (verbose >= 2) ? (n / 20 + 1) : 0;
     if (print_stride < 1)    print_stride = 1;
@@ -1364,6 +1365,21 @@ int fplus_factor_row(int64_t n,
             pivot_threshold = pivot_rel * max_entry_k0;
         }
 
+        /* 1b. ILU breakdown: dropping emptied the active column (partial), the candidates (rook) or the whole active
+         *     submatrix (full), or left only a negligible pivot -- the exact factorization's trailing pivots are
+         *     at or below drop_tol.  As SuperLU's ILU does, replace the pivot at (k, k) by drop_tol * max|a_ij| (no
+         *     swap) so the preconditioner exists; the count is reported (out->n_pivots_replaced). */
+        if ((!found || best_abs_k < pivot_threshold || best_abs_k == 0.0) && drop_tol > 0.0 && drop_tol * max_entry_k0 > 0.0) {
+            const double rep = drop_tol * max_entry_k0;
+            int64_t pos = bsearch_i64(M[k].cols, k, M[k].nnz);
+            int irc = 0;
+            if (pos >= 0) { if (is_complex) M[k].vals_z[pos] = rep; else M[k].vals_d[pos] = rep; }
+            else irc = is_complex ? sr_insert_z(&M[k], k, rep) : sr_insert_d(&M[k], k, rep);
+            if (irc != 0) goto oom;
+            pi = k; pj = k; found = 1; best_abs_k = rep;
+            n_replaced++;
+        }
+
         if (!found || best_abs_k < pivot_threshold) {
             fplus_errf(err, errlen,
                 "Near-zero or zero pivot %.6e at step %ld "
@@ -1413,6 +1429,23 @@ int fplus_factor_row(int64_t n,
                 "Pivot entry missing at step %ld after swap.", (long)k);
             ret = FPLUS_ERR_INTERNAL;
             goto fail;
+        }
+
+        /* 4b. ILU: row k is final -- it becomes row k of U.  Drop its off-pivot entries with |v| <= drop_tol before it
+         *     updates the rows below (ILUT's drop-before-use), so L U factors exactly the matrix the elimination worked
+         *     on, minus the dropped entries.  The pivot is kept. */
+        if (drop_tol > 0.0) {
+            SparseRow *rk = &M[k];
+            int64_t w = 0;
+            for (int64_t t = 0; t < rk->nnz; t++) {
+                double av = is_complex ? cabs(rk->vals_z[t]) : fabs(rk->vals_d[t]);
+                if (rk->cols[t] != k && av <= drop_tol) continue;
+                rk->cols[w] = rk->cols[t];
+                if (is_complex) rk->vals_z[w] = rk->vals_z[t]; else rk->vals_d[w] = rk->vals_d[t];
+                if (rk->cols[t] == k) pp = w;
+                w++;
+            }
+            rk->nnz = w;
         }
 
         /* 5. Eliminate column k in rows k+1..n-1 — parallel.
@@ -1621,6 +1654,9 @@ int fplus_factor_row(int64_t n,
                "total nnz=%ld, time=%.3fs\n",
                (long)l_nnz, (long)u_nnz, (long)(l_nnz + u_nnz),
                total_elapsed);
+        if (n_replaced > 0)
+            printf("[FPLUS] ILU: %ld zero / negligible pivots replaced by drop_tol * max|a_ij| = %.3e\n",
+                   (long)n_replaced, drop_tol * max_entry_k0);
         fflush(stdout);
     }
 
@@ -1628,7 +1664,7 @@ int fplus_factor_row(int64_t n,
     out->n = n; out->is_complex = is_complex; out->csc = 0;
     out->Lp = L_indptr; out->Li = L_indices; out->Lx = is_complex ? (void *)L_data_z : (void *)L_data_d;
     out->Up = U_indptr; out->Ui = U_indices; out->Ux = is_complex ? (void *)U_data_z : (void *)U_data_d;
-    out->p = p; out->q = q;
+    out->p = p; out->q = q; out->n_pivots_replaced = n_replaced;
     return FPLUS_OK;
 
 oom:

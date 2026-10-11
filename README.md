@@ -182,6 +182,25 @@ MATRIX_FACTORIZER = FPLUSColamdTauFactorized
 VERBOSE_FACTORIZATION = 0
 ```
 
+## Incomplete LU (preconditioner)
+
+`drop_tol > 0` gives a threshold incomplete LU in place of the exact
+factorization, with any pivot strategy, from Python
+(`SparseLU(A, drop_tol=1e-3)`) or C (`opt.drop_tol = 1e-3`):
+
+- on the equilibrated, ordered matrix, multipliers and updated or fill values
+  with `|v| <= drop_tol` are dropped as they arise, and a pivot row's small
+  off-pivot entries are dropped before it updates the rows below (ILUT's
+  drop-before-use); pivots are never dropped.  After Ruiz equilibration the
+  entries are O(1), so `drop_tol` is effectively relative;
+- `solve` then applies `(LU)^-1`: use it as the preconditioner of an
+  iterative solver (e.g. `scipy.sparse.linalg.gmres(A, b, M=LinearOperator(A.shape, lu.solve))`);
+- if the exact factorization's trailing pivots are at or below `drop_tol`,
+  dropping can leave no pivot; the pivot is then replaced by
+  `drop_tol * max|a_ij|` (as SuperLU's ILU does), with a RuntimeWarning in
+  Python and the count in `n_pivots_replaced` in C.  Choose `drop_tol` below
+  the matrix's small pivots for a useful preconditioner.
+
 ## Pivot strategy guide
 
 For typical Dedalus EVP problems, use **partial pivoting** (default). It

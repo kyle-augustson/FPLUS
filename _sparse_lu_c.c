@@ -173,6 +173,11 @@ static PyObject *factors_to_dict(fplus_factors *f)
                             "U_data", U_dat, "U_indices", U_idx, "U_indptr", U_ptr, "p", p_arr, "q", q_arr);
     } else
         PyErr_NoMemory();
+    if (result && f->n_pivots_replaced > 0) {
+        PyObject *nr = PyLong_FromLongLong((long long)f->n_pivots_replaced);
+        if (!nr || PyDict_SetItemString(result, "n_pivots_replaced", nr)) Py_CLEAR(result);
+        Py_XDECREF(nr);
+    }
     Py_XDECREF(L_dat); Py_XDECREF(L_idx); Py_XDECREF(L_ptr); Py_XDECREF(U_dat); Py_XDECREF(U_idx); Py_XDECREF(U_ptr);
     Py_XDECREF(p_arr); Py_XDECREF(q_arr);
     fplus_factors_free(f);
@@ -512,6 +517,6 @@ PyInit__sparse_lu_c(void)
     import_array();
     PyObject *m = PyModule_Create(&moduledef);
     /* the Python layer requires this version, so a stale build cannot silently stand in for the current one (audit 2026-10-10) */
-    if (m && PyModule_AddIntConstant(m, "API_VERSION", 2) != 0) { Py_DECREF(m); return NULL; }
+    if (m && PyModule_AddIntConstant(m, "API_VERSION", 3) != 0) { Py_DECREF(m); return NULL; }
     return m;
 }

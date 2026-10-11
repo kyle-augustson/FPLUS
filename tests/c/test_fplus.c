@@ -1,6 +1,6 @@
 /* test_fplus.c -- C-interface tests (ctest): analyze / factor / solve on complex and real matrices with dense lines and
- * strong scaling, all three solve directions, several right-hand sides, the low-level supernodal and row kernels, the
- * Ruiz range guard, and input validation.  Exit status 0 when every check passes. */
+ * strong scaling, all three solve directions, several right-hand sides and all pivot strategies, incomplete LU as a
+ * preconditioner, the low-level supernodal and row kernels, the Ruiz range guard, and input validation.  Exit status 0 when every check passes. */
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
@@ -88,12 +88,12 @@ static double backward_error(const Csc *A, const void *x, const void *b, int tra
     return sqrt(nr) / (nA * sqrt(nx) + sqrt(nb));
 }
 
-static void test_high_level(int cplx, double scale)
+static void test_high_level(int cplx, double scale, int strategy)
 {
     const int64_t n = 300, nrhs = 3;
     Csc A = make_matrix(n, cplx, scale);
     char err[256] = {0};
-    fplus_options opt; fplus_default_options(&opt); opt.relax_rows = 4; opt.panel = 16;
+    fplus_options opt; fplus_default_options(&opt); opt.relax_rows = 4; opt.panel = 16; opt.pivot_strategy = strategy;
     fplus_symbolic *sym = NULL; fplus_numeric *num = NULL;
     int rc = fplus_analyze_opts(n, A.p, A.i, &opt, &sym, err, sizeof(err));
     CHECK(rc == FPLUS_OK, "analyze: %d %s", rc, err);
@@ -112,11 +112,121 @@ static void test_high_level(int cplx, double scale)
         CHECK(rc == FPLUS_OK, "solve trans %d: %d %s", trans, rc, err);
         for (int64_t r = 0; r < nrhs; r++) {
             double be = backward_error(&A, (char *)x + (size_t)(r * n) * vs, (char *)b + (size_t)(r * n) * vs, trans);
-            CHECK(be < 1e-12, "%s scale 1e%g trans %d rhs %ld: backward error %.2e", cplx ? "complex" : "real", scale, trans, (long)r, be);
+            CHECK(be < 1e-12, "%s scale 1e%g strategy %d trans %d rhs %ld: backward error %.2e", cplx ? "complex" : "real", scale,
+                  strategy, trans, (long)r, be);
         }
         free(b); free(x);
     }
     fplus_numeric_free(num); fplus_symbolic_free(sym); free_matrix(&A);
+}
+
+static int64_t factor_nnz(const fplus_numeric *num)
+{
+    const fplus_factors *f = fplus_numeric_factors(num);
+    return f->Lp[f->n] + f->Up[f->n];
+}
+
+/* the 5-point convection-diffusion operator on a g x g grid (complex: with an imaginary shift), canonical CSC */
+static Csc make_convdiff(int64_t g, int cplx)
+{
+    Csc A; A.n = g * g; A.cplx = cplx;
+    const int64_t n = A.n;
+    A.p = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t)); A.i = (int64_t *)malloc((size_t)(5 * n) * sizeof(int64_t));
+    A.x = malloc((size_t)(5 * n) * (cplx ? sizeof(double complex) : sizeof(double)));
+    int64_t o = 0; A.p[0] = 0;
+    for (int64_t j = 0; j < n; j++) {        /* column j: the rows coupled to unknown j, ascending */
+        const int64_t gx = j % g, gy = j / g;
+        const int64_t rows[5] = {gy > 0 ? j - g : -1, gx > 0 ? j - 1 : -1, j, gx < g - 1 ? j + 1 : -1, gy < g - 1 ? j + g : -1};
+        const double vals[5] = {-1.0 - 0.3, -1.0 - 0.2, 4.0, -1.0 + 0.2, -1.0 + 0.3};   /* row i's coefficient of unknown j */
+        for (int t = 0; t < 5; t++) {
+            if (rows[t] < 0) continue;
+            A.i[o] = rows[t];
+            if (cplx) ((double complex *)A.x)[o] = vals[t] + (t == 2 ? 0.5 * I : 0.0); else ((double *)A.x)[o] = vals[t];
+            o++;
+        }
+        A.p[j + 1] = o;
+    }
+    A.nnz = o;
+    return A;
+}
+
+static void test_ilu(int cplx)
+{
+    /* incomplete LU through the high-level interface: less fill than the exact factorization, and a preconditioner on which
+     * the Richardson iteration x += (LU)^-1 (b - A x) converges to a full-accuracy solution */
+    Csc A = make_convdiff(20, cplx);
+    const int64_t n = A.n;
+    const size_t vs = cplx ? sizeof(double complex) : sizeof(double);
+    char err[256] = {0};
+    fplus_options opt; fplus_default_options(&opt);
+    fplus_symbolic *sym = NULL; fplus_numeric *exact = NULL, *ilu = NULL;
+    int rc = fplus_analyze_opts(n, A.p, A.i, &opt, &sym, err, sizeof(err));
+    CHECK(rc == FPLUS_OK, "ilu analyze: %s", err);
+    rc = fplus_factor(sym, A.p, A.i, A.x, cplx, &opt, &exact, err, sizeof(err));
+    CHECK(rc == FPLUS_OK, "exact factor: %s", err);
+    for (int strategy = FPLUS_PIVOT_FULL; strategy <= FPLUS_PIVOT_ROOK; strategy++) {
+        opt.pivot_strategy = strategy; opt.drop_tol = 1e-2;
+        rc = fplus_factor(sym, A.p, A.i, A.x, cplx, &opt, &ilu, err, sizeof(err));
+        CHECK(rc == FPLUS_OK, "ilu factor strategy %d: %s", strategy, err);
+        if (rc != FPLUS_OK) continue;
+        CHECK(fplus_numeric_factors(ilu)->csc == 1, "ilu factors are column-compressed");
+        CHECK(factor_nnz(ilu) < factor_nnz(exact), "ilu strategy %d: fill %ld not below the exact %ld", strategy,
+              (long)factor_nnz(ilu), (long)factor_nnz(exact));
+        void *b = malloc((size_t)n * vs), *x = calloc((size_t)n, vs), *r = malloc((size_t)n * vs);
+        for (int64_t k = 0; k < n; k++) {
+            if (cplx) ((double complex *)b)[k] = (2 * urand() - 1) + (2 * urand() - 1) * I; else ((double *)b)[k] = 2 * urand() - 1;
+        }
+        double be = 1.0; int it;
+        for (it = 0; it < 60 && be >= 1e-13; it++) {
+            matvec(&A, x, r, 0);
+            for (int64_t k = 0; k < n; k++) {
+                if (cplx) ((double complex *)r)[k] = ((double complex *)b)[k] - ((double complex *)r)[k];
+                else ((double *)r)[k] = ((double *)b)[k] - ((double *)r)[k];
+            }
+            if (fplus_solve(ilu, r, 1, n, 0, err, sizeof(err)) != FPLUS_OK) { CHECK(0, "ilu solve: %s", err); break; }
+            for (int64_t k = 0; k < n; k++) {
+                if (cplx) ((double complex *)x)[k] += ((double complex *)r)[k]; else ((double *)x)[k] += ((double *)r)[k];
+            }
+            be = backward_error(&A, x, b, 0);
+        }
+        CHECK(be < 1e-12, "ilu strategy %d: preconditioned Richardson reached backward error %.2e in %d iterations", strategy, be, it);
+        if (it > 1) printf("ilu %s strategy %d: fill %ld vs exact %ld, Richardson converged in %d iterations\n", cplx ? "complex" : "real",
+                           strategy, (long)factor_nnz(ilu), (long)factor_nnz(exact), it);
+        free(b); free(x); free(r);
+        fplus_numeric_free(ilu); ilu = NULL;
+    }
+    opt.pivot_strategy = 7;
+    CHECK(fplus_factor(sym, A.p, A.i, A.x, cplx, &opt, &ilu, err, sizeof(err)) == FPLUS_ERR_BADARG, "bad pivot_strategy rejected");
+    opt.pivot_strategy = FPLUS_PIVOT_PARTIAL; opt.drop_tol = -1.0;
+    CHECK(fplus_factor(sym, A.p, A.i, A.x, cplx, &opt, &ilu, err, sizeof(err)) == FPLUS_ERR_BADARG, "negative drop_tol rejected");
+    fplus_numeric_free(exact); fplus_symbolic_free(sym); free_matrix(&A);
+}
+
+static void test_ilu_breakdown(void)
+{
+    /* [[1, 1], [1, 1.0005]], drop_tol 1e-2, no equilibration: the second pivot is dropped and replaced by 0.010005 */
+    const int64_t n = 2;
+    int64_t Ap[3] = {0, 2, 4}, Ai[4] = {0, 1, 0, 1};
+    double Ax[4] = {1.0, 1.0, 1.0, 1.0005};
+    char err[256] = {0};
+    fplus_options opt; fplus_default_options(&opt); opt.pin_dense = 0; opt.equilibrate = 0;
+    opt.pivot_strategy = FPLUS_PIVOT_FULL; opt.drop_tol = 1e-2;
+    fplus_symbolic *sym = NULL; fplus_numeric *num = NULL;
+    int rc = fplus_analyze_opts(n, Ap, Ai, &opt, &sym, err, sizeof(err));
+    if (rc == FPLUS_OK) rc = fplus_factor(sym, Ap, Ai, Ax, 0, &opt, &num, err, sizeof(err));
+    CHECK(rc == FPLUS_OK, "ilu breakdown: %d %s", rc, err);
+    if (rc == FPLUS_OK) {
+        const fplus_factors *f = fplus_numeric_factors(num);
+        CHECK(f->n_pivots_replaced == 1, "ilu breakdown: %ld pivots replaced (expected 1)", (long)f->n_pivots_replaced);
+        double last = 0;
+        for (int64_t q = f->Up[1]; q < f->Up[2]; q++) if (f->Ui[q] == 1) last = ((const double *)f->Ux)[q];
+        CHECK(fabs(last - 0.010005) < 1e-15, "ilu breakdown: replaced pivot %.17g", last);
+        fplus_numeric_free(num); num = NULL;
+    }
+    double Bx[4] = {1.0, 1.0, 1.0, 1.0};          /* exactly singular: an exact LU still fails */
+    opt.drop_tol = 0.0;
+    CHECK(fplus_factor(sym, Ap, Ai, Bx, 0, &opt, &num, err, sizeof(err)) == FPLUS_ERR_SINGULAR, "exact LU of a singular matrix");
+    fplus_symbolic_free(sym);
 }
 
 static void test_row_kernel(void)
@@ -170,9 +280,14 @@ static void test_validation(void)
 
 int main(void)
 {
-    test_high_level(1, 0.0);
-    test_high_level(1, 6.0);
-    test_high_level(0, 6.0);
+    test_high_level(1, 0.0, FPLUS_PIVOT_PARTIAL);
+    test_high_level(1, 6.0, FPLUS_PIVOT_PARTIAL);
+    test_high_level(0, 6.0, FPLUS_PIVOT_PARTIAL);
+    test_high_level(1, 6.0, FPLUS_PIVOT_ROOK);
+    test_high_level(0, 6.0, FPLUS_PIVOT_FULL);
+    test_ilu(1);
+    test_ilu(0);
+    test_ilu_breakdown();
     test_row_kernel();
     test_ruiz_range_guard();
     test_validation();

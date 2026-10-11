@@ -42,6 +42,7 @@ typedef struct {
     int64_t *Up, *Ui; void *Ux;
     int64_t *p, *q;
     int64_t nsupernodes;
+    int64_t n_pivots_replaced;     /* incomplete LU: pivots replaced at a breakdown (see fplus_factor) */
 } fplus_factors;
 
 void fplus_factors_free(fplus_factors *f);
@@ -106,6 +107,19 @@ int fplus_factor_sn_sym(const fplus_symbolic *sym, const int64_t *Ap, const int6
                         int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops, double pivot_rel,
                         fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen);
 
+/* The row-kernel factorization of A[row_perm, :][:, col_perm] (A canonical CSC): the permuted matrix, Ruiz (when
+ * equilibrate), then fplus_factor_row with drop_tol and pivot_strategy; the factors are returned column-compressed (csc = 1)
+ * for fplus_tri_solve. */
+int fplus_factor_row_perm(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                          const int64_t *row_perm, const int64_t *col_perm,
+                          int equilibrate, int ruiz_max_iter, double ruiz_tol, int verbose,
+                          double drop_tol, int pivot_strategy, double pivot_rel,
+                          fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen);
+int fplus_factor_row_sym(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                         int equilibrate, int ruiz_max_iter, double ruiz_tol, int verbose,
+                         double drop_tol, int pivot_strategy, double pivot_rel,
+                         fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen);
+
 /* ---- the high-level interface: options, analyze, factor, solve ---- */
 typedef struct {
     int     pin_dense;          /* dense rows / columns last (default 1) */
@@ -116,6 +130,8 @@ typedef struct {
     int     ruiz_max_iter;      /* (20) */
     double  ruiz_tol;           /* (1e-2) */
     double  pivot_rel;          /* singular when the best pivot < pivot_rel * the column's max (FPLUS_PIVOT_REL_DEFAULT; 0: exact zeros only) */
+    int     pivot_strategy;     /* FPLUS_PIVOT_PARTIAL (default), _ROOK or _FULL */
+    double  drop_tol;           /* 0 (default): exact LU.  > 0: incomplete LU (ILUT-style threshold dropping), see below */
     int64_t relax_rows;         /* relaxed supernodes (32) */
     int64_t panel;              /* panel width (512) */
     int     use_gpu;            /* cuBLAS updates (0) */
@@ -130,7 +146,18 @@ int fplus_analyze_opts(int64_t n, const int64_t *Ap, const int64_t *Ai, const fp
                        fplus_symbolic **sym, char *err, size_t errlen);
 
 /* The factorization of the analysed pattern with values Ax (canonical CSC, the analysed pattern): diag(Dr) A[p,:][:,q] diag(Dc)
- * = L U, with p, q, Dr, Dc in the original coordinates. */
+ * = L U, with p, q, Dr, Dc in the original coordinates.  Partial pivoting with drop_tol 0 runs the supernodal kernel;
+ * rook / full pivoting or drop_tol > 0 the row kernel.
+ *
+ * Incomplete LU (drop_tol > 0): the factorization of the equilibrated, ordered matrix drops, as they arise, every multiplier
+ * and every updated or fill value with |v| <= drop_tol, and, when a row becomes a pivot row (its final form, row k of U),
+ * its off-pivot entries with |v| <= drop_tol before it updates the rows below.  The pivots (U's diagonal) are never dropped.
+ * With Ruiz equilibration (the default) the entries are O(1), so drop_tol acts as a relative threshold.  The factors then
+ * satisfy L U = diag(Dr) A[p,:][:,q] diag(Dc) - R with R made of the dropped entries; fplus_solve applies (L U)^-1, a
+ * preconditioner for an iterative solver rather than a solve.  When the exact factorization's trailing pivots are at or below
+ * drop_tol, dropping can leave no pivot at all (a breakdown): the pivot is then replaced by drop_tol * max|a_ij| as in
+ * SuperLU's ILU, and the factors count these replacements (fplus_numeric_factors(num)->n_pivots_replaced).  With drop_tol 0
+ * a zero pivot is FPLUS_ERR_SINGULAR. */
 typedef struct fplus_numeric fplus_numeric;
 int fplus_factor(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
                  const fplus_options *opt, fplus_numeric **num, char *err, size_t errlen);

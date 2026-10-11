@@ -15,7 +15,8 @@ void fplus_default_options(fplus_options *o)
 {
     o->pin_dense = 1; o->tau_density = 0.5; o->tau_min_nnz = 10; o->postorder = 1;
     o->equilibrate = 1; o->ruiz_max_iter = 20; o->ruiz_tol = 1e-2;
-    o->pivot_rel = FPLUS_PIVOT_REL_DEFAULT; o->relax_rows = 32; o->panel = 512;
+    o->pivot_rel = FPLUS_PIVOT_REL_DEFAULT; o->pivot_strategy = FPLUS_PIVOT_PARTIAL; o->drop_tol = 0.0;
+    o->relax_rows = 32; o->panel = 512;
     o->use_gpu = 0; o->gpu_min_flops = 5e7; o->verbose = 0;
 }
 
@@ -44,9 +45,21 @@ int fplus_factor(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai
     double *Drp = (double *)malloc(nn * sizeof(double)), *Dcp = (double *)malloc(nn * sizeof(double));
     if (!num || !Drp || !Dcp) { free(num); free(Drp); free(Dcp); fplus_errf(err, errlen, "out of memory"); return FPLUS_ERR_NOMEM; }
     num->n = n; num->is_complex = is_complex;
-    int rc = fplus_factor_sn_sym(sym, Ap, Ai, Ax, is_complex, opt->equilibrate, opt->ruiz_max_iter, opt->ruiz_tol, opt->verbose,
+    int rc;
+    if (opt->pivot_strategy != FPLUS_PIVOT_PARTIAL && opt->pivot_strategy != FPLUS_PIVOT_ROOK && opt->pivot_strategy != FPLUS_PIVOT_FULL) {
+        fplus_errf(err, errlen, "pivot_strategy must be FPLUS_PIVOT_PARTIAL, _ROOK or _FULL (got %d)", opt->pivot_strategy);
+        rc = FPLUS_ERR_BADARG;
+    } else if (!(opt->drop_tol >= 0.0)) {
+        fplus_errf(err, errlen, "drop_tol must be >= 0 (got %g)", opt->drop_tol);
+        rc = FPLUS_ERR_BADARG;
+    } else if (opt->pivot_strategy == FPLUS_PIVOT_PARTIAL && opt->drop_tol == 0.0) {
+        rc = fplus_factor_sn_sym(sym, Ap, Ai, Ax, is_complex, opt->equilibrate, opt->ruiz_max_iter, opt->ruiz_tol, opt->verbose,
                                  opt->relax_rows, opt->panel, opt->use_gpu, opt->gpu_min_flops, opt->pivot_rel, &num->f,
                                  Drp, Dcp, err, errlen);
+    } else {
+        rc = fplus_factor_row_sym(sym, Ap, Ai, Ax, is_complex, opt->equilibrate, opt->ruiz_max_iter, opt->ruiz_tol, opt->verbose,
+                                  opt->drop_tol, opt->pivot_strategy, opt->pivot_rel, &num->f, Drp, Dcp, err, errlen);
+    }
     if (rc != FPLUS_OK) { free(Drp); free(Dcp); fplus_numeric_free(num); return rc; }
     num->p = (int64_t *)malloc(nn * sizeof(int64_t)); num->q = (int64_t *)malloc(nn * sizeof(int64_t));
     num->Dr = (double *)malloc(nn * sizeof(double)); num->Dc = (double *)malloc(nn * sizeof(double));

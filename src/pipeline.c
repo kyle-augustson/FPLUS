@@ -96,3 +96,101 @@ int fplus_factor_sn_sym(const fplus_symbolic *sym, const int64_t *Ap, const int6
                                 equilibrate, ruiz_max_iter, ruiz_tol, verbose, relax_rows, panel, use_gpu, gpu_min_flops,
                                 pivot_rel, out, Dr, Dc, err, errlen);
 }
+
+/* ---- the row-kernel path (rook / full pivoting, or ILU): the same static orders and equilibration, then the CSR kernel;
+ * the factors come back in CSC for the triangular solves (the Python layer's _lu_factor_c + SparseLU's tocsc). ---- */
+
+/* the transpose of a compressed n x n pattern with values: CSC <-> CSR of the same matrix, indices ascending */
+static int compressed_transpose(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax, size_t vs,
+                                int64_t **Tp_out, int64_t **Ti_out, void **Tx_out)
+{
+    const int64_t nnz = Ap[n];
+    int64_t *Tp = (int64_t *)calloc((size_t)(n + 1), sizeof(int64_t));
+    int64_t *Ti = (int64_t *)malloc((size_t)(nnz > 0 ? nnz : 1) * sizeof(int64_t));
+    void *Tx = malloc((size_t)(nnz > 0 ? nnz : 1) * vs);
+    int64_t *next = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    if (!Tp || !Ti || !Tx || !next) { free(Tp); free(Ti); free(Tx); free(next); return FPLUS_ERR_NOMEM; }
+    for (int64_t q = 0; q < nnz; q++) Tp[Ai[q] + 1]++;
+    for (int64_t i = 0; i < n; i++) Tp[i + 1] += Tp[i];
+    memcpy(next, Tp, (size_t)n * sizeof(int64_t));
+    for (int64_t j = 0; j < n; j++)            /* j ascending: the transposed indices come out sorted */
+        for (int64_t q = Ap[j]; q < Ap[j + 1]; q++) {
+            int64_t d = next[Ai[q]]++;
+            Ti[d] = j;
+            memcpy((char *)Tx + (size_t)d * vs, (const char *)Ax + (size_t)q * vs, vs);
+        }
+    free(next);
+    *Tp_out = Tp; *Ti_out = Ti; *Tx_out = Tx;
+    return FPLUS_OK;
+}
+
+/* row-compressed factors -> column-compressed, in place */
+static int factors_to_csc(fplus_factors *f)
+{
+    if (f->csc) return FPLUS_OK;
+    const size_t vs = f->is_complex ? sizeof(double complex) : sizeof(double);
+    int64_t *Lp, *Li, *Up, *Ui; void *Lx, *Ux;
+    int rc = compressed_transpose(f->n, f->Lp, f->Li, f->Lx, vs, &Lp, &Li, &Lx);
+    if (rc != FPLUS_OK) return rc;
+    rc = compressed_transpose(f->n, f->Up, f->Ui, f->Ux, vs, &Up, &Ui, &Ux);
+    if (rc != FPLUS_OK) { free(Lp); free(Li); free(Lx); return rc; }
+    free(f->Lp); free(f->Li); free(f->Lx); free(f->Up); free(f->Ui); free(f->Ux);
+    f->Lp = Lp; f->Li = Li; f->Lx = Lx; f->Up = Up; f->Ui = Ui; f->Ux = Ux; f->csc = 1;
+    return FPLUS_OK;
+}
+
+int fplus_factor_row_perm(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                          const int64_t *row_perm, const int64_t *col_perm,
+                          int equilibrate, int ruiz_max_iter, double ruiz_tol, int verbose,
+                          double drop_tol, int pivot_strategy, double pivot_rel,
+                          fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen)
+{
+    memset(out, 0, sizeof(*out));
+    {
+        int vrc = fplus_check_compressed(n, Ap, Ai, 1, err, errlen);
+        unsigned char *seen = vrc == FPLUS_OK ? (unsigned char *)calloc((size_t)(n > 0 ? n : 1), 1) : NULL;
+        if (vrc == FPLUS_OK && !seen) { fplus_errf(err, errlen, "out of memory"); return FPLUS_ERR_NOMEM; }
+        if (vrc == FPLUS_OK) vrc = fplus_check_perm(n, row_perm, seen, "row_perm", err, errlen);
+        if (vrc == FPLUS_OK) { memset(seen, 0, (size_t)(n > 0 ? n : 1)); vrc = fplus_check_perm(n, col_perm, seen, "col_perm", err, errlen); }
+        free(seen);
+        if (vrc != FPLUS_OK) return vrc;
+    }
+    const size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
+    int64_t *Bp = NULL, *Bi = NULL; void *Bx = NULL;
+    int rc = permute_csc(n, Ap, Ai, Ax, is_complex, row_perm, col_perm, &Bp, &Bi, &Bx);
+    if (rc != FPLUS_OK) { fplus_errf(err, errlen, "out of memory"); return rc; }
+    if (equilibrate)
+        rc = fplus_ruiz(n, Bp, Bi, Bx, is_complex, 1, ruiz_max_iter, ruiz_tol, verbose, Dr, Dc, err, errlen);
+    else
+        for (int64_t i = 0; i < n; i++) { Dr[i] = 1.0; Dc[i] = 1.0; }
+    int64_t *Rp = NULL, *Ri = NULL; void *Rx = NULL;
+    if (rc == FPLUS_OK) {
+        rc = compressed_transpose(n, Bp, Bi, Bx, vs, &Rp, &Ri, &Rx);
+        if (rc != FPLUS_OK) fplus_errf(err, errlen, "out of memory");
+    }
+    free(Bp); free(Bi); free(Bx);
+    if (rc == FPLUS_OK)
+        rc = fplus_factor_row(n, Rp, Ri, Rx, drop_tol, is_complex, verbose, pivot_strategy, pivot_rel, out, err, errlen);
+    free(Rp); free(Ri); free(Rx);
+    if (rc == FPLUS_OK && (rc = factors_to_csc(out)) != FPLUS_OK) {
+        fplus_factors_free(out);
+        fplus_errf(err, errlen, "out of memory");
+    }
+    return rc;
+}
+
+int fplus_factor_row_sym(const fplus_symbolic *sym, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex,
+                         int equilibrate, int ruiz_max_iter, double ruiz_tol, int verbose,
+                         double drop_tol, int pivot_strategy, double pivot_rel,
+                         fplus_factors *out, double *Dr, double *Dc, char *err, size_t errlen)
+{
+    const int64_t n = fplus_symbolic_n(sym);
+    if (Ap[n] != fplus_symbolic_nnz(sym)) {
+        memset(out, 0, sizeof(*out));
+        fplus_errf(err, errlen, "the matrix has %ld nonzeros, the symbolic analysis %ld", (long)Ap[n], (long)fplus_symbolic_nnz(sym));
+        return FPLUS_ERR_BADARG;
+    }
+    return fplus_factor_row_perm(n, Ap, Ai, Ax, is_complex, fplus_symbolic_row_perm(sym), fplus_symbolic_col_perm(sym),
+                                 equilibrate, ruiz_max_iter, ruiz_tol, verbose, drop_tol, pivot_strategy, pivot_rel,
+                                 out, Dr, Dc, err, errlen);
+}
