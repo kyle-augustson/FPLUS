@@ -233,3 +233,29 @@ def test_cache_concurrent_threads():
     for t in th: t.start()
     for t in th: t.join()
     assert not errors, errors
+
+
+# ---------------------------------------------------------------- row kernel: drop_tol filters computed values only
+def _drop_block(npad, cplx):
+    """A 3x3 block whose row 1 holds a12 = 5e-3 < drop_tol that the update from row 0 does not touch but that feeds U22 = 4 - 0.5 a12
+    on the next step; npad padding columns on rows 0 and 1 push the row-0 update onto the BLAS axpy path without changing the
+    block's arithmetic.  Dominant pivots (8, 6, then U22) with padding diagonals 1, so every strategy picks the same order."""
+    n = 3 + 2 * npad
+    A = sp.lil_matrix((n, n), dtype=complex if cplx else float)
+    A[0, 0] = 8; A[1, 0] = 4; A[1, 1] = 6; A[1, 2] = 5e-3; A[2, 1] = 3; A[2, 2] = 4
+    for t in range(npad):
+        A[0, 3 + t] = 1; A[1, 3 + npad + t] = 1
+    for j in range(3, n):
+        A[j, j] = 1
+    return A.tocsr()
+
+
+@pytest.mark.parametrize("cplx", [False, True])
+@pytest.mark.parametrize("strategy", ["partial", "rook", "full"])
+def test_row_kernel_drop_independent_of_axpy_path(cplx, strategy):
+    for npad in (0, 40):
+        L, U, p, q, Dr, Dc = sparse_lu_full_pivot(_drop_block(npad, cplx), drop_tol=1e-2, equilibrate=False, colamd=False,
+                                                  pivot_strategy=strategy)
+        U = U.tocsr()
+        k2 = int(np.where(p == 2)[0][0]); c2 = int(np.where(q == 2)[0][0])
+        assert abs(U[k2, c2] - 3.9975) < 1e-12, (npad, U[k2, c2])

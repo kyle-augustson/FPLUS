@@ -791,7 +791,7 @@ static int row_axpy_z_blas(SparseRow * restrict M,
     while (pi < ni && pk < nk) {
         int64_t ci = ri->cols[pi], ck = rk->cols[pk];
         if (ci < ck) {
-            tmp_cols[U]    = ci;
+            tmp_cols[U]    = ~ci;            /* untouched by this update: passes through unfiltered */
             tmp_vals_i[U]  = ri->vals_z[pi];
             tmp_vals_k[U]  = 0.0;
             pi++; U++;
@@ -808,7 +808,7 @@ static int row_axpy_z_blas(SparseRow * restrict M,
         }
     }
     while (pi < ni) {
-        tmp_cols[U]    = ri->cols[pi];
+        tmp_cols[U]    = ~ri->cols[pi];
         tmp_vals_i[U]  = ri->vals_z[pi];
         tmp_vals_k[U]  = 0.0;
         pi++; U++;
@@ -826,15 +826,23 @@ static int row_axpy_z_blas(SparseRow * restrict M,
         cblas_zaxpy((int)U, &alpha, tmp_vals_k, 1, tmp_vals_i, 1);
     }
 
-    /* Pass 3: filter, strip column k, and write back to ri. */
+    /* Pass 3: filter the computed entries (drop exact zeros and, for ILU, |v| <= drop_tol), strip column k, and write
+     * back to ri.  Entries of row i that this update did not touch (marked ~col in pass 1) pass through unchanged, as in
+     * the merge path and the Python reference: drop_tol applies to the values an update computes, so the factors do not
+     * depend on which path a row's size selects. */
     int64_t final_nnz = 0;
     for (int64_t p = 0; p < U; p++) {
-        if (tmp_cols[p] == k) continue;
+        int64_t c = tmp_cols[p];
         double complex v = tmp_vals_i[p];
-        double av = cabs(v);
-        if (av == 0.0) continue;
-        if (drop_tol > 0.0 && av <= drop_tol) continue;
-        tmp_cols[final_nnz]   = tmp_cols[p];
+        if (c < 0) {
+            c = ~c;                          /* entry of row i only: kept as is, as in the merge path */
+        } else {
+            if (c == k) continue;
+            double av = cabs(v);
+            if (av == 0.0) continue;
+            if (drop_tol > 0.0 && av <= drop_tol) continue;
+        }
+        tmp_cols[final_nnz]   = c;
         tmp_vals_i[final_nnz] = v;
         final_nnz++;
     }
@@ -861,7 +869,7 @@ static int row_axpy_d_blas(SparseRow * restrict M,
     while (pi < ni && pk < nk) {
         int64_t ci = ri->cols[pi], ck = rk->cols[pk];
         if (ci < ck) {
-            tmp_cols[U]    = ci;
+            tmp_cols[U]    = ~ci;            /* untouched by this update: passes through unfiltered */
             tmp_vals_i[U]  = ri->vals_d[pi];
             tmp_vals_k[U]  = 0.0;
             pi++; U++;
@@ -878,7 +886,7 @@ static int row_axpy_d_blas(SparseRow * restrict M,
         }
     }
     while (pi < ni) {
-        tmp_cols[U]    = ri->cols[pi];
+        tmp_cols[U]    = ~ri->cols[pi];
         tmp_vals_i[U]  = ri->vals_d[pi];
         tmp_vals_k[U]  = 0.0;
         pi++; U++;
@@ -896,12 +904,17 @@ static int row_axpy_d_blas(SparseRow * restrict M,
 
     int64_t final_nnz = 0;
     for (int64_t p = 0; p < U; p++) {
-        if (tmp_cols[p] == k) continue;
+        int64_t c = tmp_cols[p];
         double v = tmp_vals_i[p];
-        double av = fabs(v);
-        if (av == 0.0) continue;
-        if (drop_tol > 0.0 && av <= drop_tol) continue;
-        tmp_cols[final_nnz]   = tmp_cols[p];
+        if (c < 0) {
+            c = ~c;                          /* entry of row i only: kept as is, as in the merge path */
+        } else {
+            if (c == k) continue;
+            double av = fabs(v);
+            if (av == 0.0) continue;
+            if (drop_tol > 0.0 && av <= drop_tol) continue;
+        }
+        tmp_cols[final_nnz]   = c;
         tmp_vals_i[final_nnz] = v;
         final_nnz++;
     }
