@@ -74,6 +74,11 @@ endif()
 # ---------------------------------------------------------------------------- the core
 set(FPLUS_SOURCES src/factor_row.c src/factor_sn.c src/equil.c src/solve.c src/order.c src/pipeline.c src/numeric.c src/solve_plan.c)
 add_library(fplus_core OBJECT ${FPLUS_SOURCES})
+# the triangular solves without floating-point contraction: every operation rounds as written, so the blocked solves (written-out
+# complex products) give the same bits as the plain sweeps (C99 products), and as setup.py's build
+if(NOT MSVC)
+  set_source_files_properties(src/solve.c src/solve_plan.c PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+endif()
 set_target_properties(fplus_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(fplus_core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> PRIVATE src)
 target_compile_options(fplus_core PRIVATE ${FPLUS_C_FLAGS})

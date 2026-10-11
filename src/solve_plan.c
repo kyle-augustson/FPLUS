@@ -24,8 +24,22 @@
 #define PLAN_OMP(x)
 #endif
 
+/* -DPLAN_PROFILE: wall time and entries per phase of the forward / backward sweeps, printed after each solve with A
+ * (global state: one solve at a time).  0 plain-sweep supernodes of L, 1 L triangles, 2 L updates threaded, 3 L updates
+ * on one thread, 4 U triangles, 5 U updates threaded, 6 U updates on one thread */
+#if defined(PLAN_PROFILE) && defined(_OPENMP)
+#include <stdio.h>
+static double plan_t[7], plan_e[7];
+#define PT_START(v) const double v = omp_get_wtime()
+#define PT_ADD(v, k, ent) do { plan_t[k] += omp_get_wtime() - (v); plan_e[k] += (double)(ent); } while (0)
+#else
+#define PT_START(v) do {} while (0)
+#define PT_ADD(v, k, ent) do {} while (0)
+#endif
+
 struct fplus_solve_plan {
     int64_t n, nnzL, nnzU;
+    int64_t block, chunk_min;   /* columns per block; minimum target rows per parallel task (FPLUS_PLAN_BLOCK / _CHUNK_MIN) */
     int generic;                /* the L pattern lacks the layout (diagonal first in every column): plain sweeps */
     int64_t nsn, *sn;           /* L supernode s: columns sn[s] .. sn[s+1]-1 */
     unsigned char *sn_par;      /* 1: the rows R are distinct and below the supernode (blocked, threaded); 0: plain sweeps */
@@ -64,6 +78,11 @@ int fplus_solve_plan_create(int64_t n, const int64_t *Lp, const int64_t *Li, con
     fplus_solve_plan *pl = (fplus_solve_plan *)calloc(1, sizeof(*pl));
     if (!pl) goto oom;
     pl->n = n; pl->nnzL = Lp[n]; pl->nnzU = Up[n];
+    {   /* tuning knobs for experiments; the defaults otherwise */
+        const char *e = getenv("FPLUS_PLAN_BLOCK"), *c = getenv("FPLUS_PLAN_CHUNK_MIN");
+        pl->block = e && atol(e) > 0 ? atol(e) : PLAN_BLOCK;
+        pl->chunk_min = c && atol(c) > 0 ? atol(c) : PLAN_CHUNK / 8;
+    }
     for (int64_t j = 0; j < n; j++)
         if (Lp[j] >= Lp[j + 1] || Li[Lp[j]] != j) { pl->generic = 1; *out = pl; return FPLUS_OK; }
 
@@ -152,11 +171,26 @@ oom:
     return FPLUS_ERR_NOMEM;
 }
 
+/* y -= a * b.  The complex product written out (the textbook formula, as C99's complex multiply computes it without its NaN
+ * recovery): the loops vectorize, where the C99 product's NaN branch keeps them scalar (4x slower per entry on current x86-64 server CPUs with gcc 11).
+ * The solve files are compiled without floating-point contraction (CMakeLists.txt, setup.py), so every operation rounds as written:
+ * the same bits as fplus_tri_solve's C99 products, on any compiler or flags.  Finite factors and right-hand sides only (no NaN
+ * recovery; the factorizations reject non-finite input). */
+static inline void fms_z(double complex *y, double complex a, double complex b)
+{
+    const double ar = creal(a), ai = cimag(a), br = creal(b), bi = cimag(b);
+    double *yd = (double *)y;
+    yd[0] = yd[0] - (ar * br - ai * bi);
+    yd[1] = yd[1] - (ar * bi + ai * br);
+}
+#define FMS_z(y, a, b) fms_z(&(y), (a), (b))
+#define FMS_d(y, a, b) ((y) = (y) - (a) * (b))
+
 static inline int64_t min_i64(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t max_i64(int64_t a, int64_t b) { return a > b ? a : b; }
 
 /* rows per parallel task: about 4 tasks per thread, within [PLAN_CHUNK / 8, PLAN_CHUNK] */
-static inline int64_t plan_chunk(int64_t rows)
+static inline int64_t plan_chunk(int64_t rows, int64_t cmin)
 {
 #ifdef _OPENMP
     const int64_t T = omp_get_max_threads();
@@ -164,7 +198,8 @@ static inline int64_t plan_chunk(int64_t rows)
     const int64_t T = 1;
 #endif
     const int64_t c = (rows + 4 * T - 1) / (4 * T);
-    return c < PLAN_CHUNK / 8 ? PLAN_CHUNK / 8 : (c > PLAN_CHUNK ? PLAN_CHUNK : c);
+    const int64_t cmax = cmin > PLAN_CHUNK ? cmin : PLAN_CHUNK;
+    return c < cmin ? cmin : (c > cmax ? cmax : c);
 }
 
 #define PLAN_KERNELS(SUF, T, CJ)                                                                                         \
@@ -175,29 +210,34 @@ static void fwdL_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int6
     for (int64_t s = 0; s < pl->nsn; s++) {                                                                              \
         const int64_t c0 = pl->sn[s], c1 = pl->sn[s + 1];                                                                \
         if (!pl->sn_par[s]) {                  /* the plain column sweep of fplus_tri_solve */                           \
+            PT_START(t0);                                                                                                \
             for (int64_t j = c0; j < c1; j++)                                                                            \
                 for (int64_t r = 0; r < nrhs; r++) {                                                                     \
                     T *xr = x + r * ldx; const T xj = xr[j];                                                             \
                     if (xj == 0) continue;                                                                               \
-                    for (int64_t q = Lp[j]; q < Lp[j + 1]; q++) { const int64_t i = Li[q]; if (i != j) xr[i] -= xj * Lx[q]; } \
+                    for (int64_t q = Lp[j]; q < Lp[j + 1]; q++) { const int64_t i = Li[q]; if (i != j) FMS_##SUF(xr[i], xj, Lx[q]); } \
                 }                                                                                                        \
+            PT_ADD(t0, 0, Lp[c1] - Lp[c0]);                                                                              \
             continue;                                                                                                    \
         }                                                                                                                \
         const int64_t *R = Li + Lp[c1 - 1] + 1, m = Lp[c1] - Lp[c1 - 1] - 1;                                            \
-        for (int64_t k0 = c0; k0 < c1; k0 += PLAN_BLOCK) {                                                               \
-            const int64_t k1 = min_i64(k0 + PLAN_BLOCK, c1);                                                             \
+        for (int64_t k0 = c0; k0 < c1; k0 += pl->block) {                                                               \
+            const int64_t k1 = min_i64(k0 + pl->block, c1);                                                             \
+            PT_START(t1);                                                                                                \
             for (int64_t c = k0; c < k1; c++) {   /* the block's triangle: rows c+1 .. k1-1 at Lp[c]+1 .. */             \
                 const T *v = Lx + Lp[c] + 1;                                                                             \
                 for (int64_t r = 0; r < nrhs; r++) {                                                                     \
                     T *xr = x + r * ldx; const T xc = xr[c];                                                             \
                     if (xc == 0) continue;                                                                               \
-                    for (int64_t i = c + 1; i < k1; i++) xr[i] -= xc * v[i - c - 1];                                     \
+                    for (int64_t i = c + 1; i < k1; i++) FMS_##SUF(xr[i], xc, v[i - c - 1]);                                     \
                 }                                                                                                        \
             }                                                                                                            \
+            PT_ADD(t1, 1, (k1 - k0) * (k1 - k0 - 1) / 2);                                                                \
             /* the rows below the block: pivot rows k1 .. c1-1, then R; position p of column c at Lp[c] + (k1 - c) + p */ \
             const int64_t nt = c1 - k1, nb = nt + m;                                                                     \
             if (nb == 0) continue;                                                                                       \
-            const int64_t cs = plan_chunk(nb), nch = (nb + cs - 1) / cs;                                                      \
+            PT_START(t2);                                                                                                \
+            const int64_t cs = plan_chunk(nb, pl->chunk_min), nch = (nb + cs - 1) / cs;                                                      \
             const int par = nch > 1 && nb * (k1 - k0) * nrhs >= PLAN_PAR_MIN; (void)par;                                            \
             PLAN_OMP("omp parallel for schedule(dynamic, 1) if (par)")                                                    \
             for (int64_t ch = 0; ch < nch; ch++) {                                                                       \
@@ -208,11 +248,12 @@ static void fwdL_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int6
                     for (int64_t r = 0; r < nrhs; r++) {                                                                 \
                         T *xr = x + r * ldx; const T xc = xr[c];                                                         \
                         if (xc == 0) continue;                                                                           \
-                        for (int64_t p = p0; p < pt; p++) xr[k1 + p] -= xc * v[p];                                       \
-                        for (int64_t p = pr; p < p1; p++) xr[R[p - nt]] -= xc * v[p];                                    \
+                        for (int64_t p = p0; p < pt; p++) FMS_##SUF(xr[k1 + p], xc, v[p]);                                       \
+                        for (int64_t p = pr; p < p1; p++) FMS_##SUF(xr[R[p - nt]], xc, v[p]);                                    \
                     }                                                                                                    \
                 }                                                                                                        \
             }                                                                                                            \
+            PT_ADD(t2, par ? 2 : 3, nb * (k1 - k0));                                                                     \
         }                                                                                                                \
     }                                                                                                                    \
 }                                                                                                                        \
@@ -223,9 +264,10 @@ static void bwdU_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t nr
     const int64_t *sp = pl->useg_ptr, *srow = pl->useg_row, *slen = pl->useg_len, *soff = pl->useg_off, *srt = pl->useg_srt; \
     for (int64_t s = pl->nsn - 1; s >= 0; s--) {                                                                         \
         const int64_t c0 = pl->sn[s], c1 = pl->sn[s + 1];                                                                \
-        for (int64_t k1 = c1; k1 > c0; k1 -= PLAN_BLOCK) {                                                               \
-            const int64_t k0 = max_i64(k1 - PLAN_BLOCK, c0);                                                             \
+        for (int64_t k1 = c1; k1 > c0; k1 -= pl->block) {                                                               \
+            const int64_t k0 = max_i64(k1 - pl->block, c0);                                                             \
             int64_t lo_row = k0, work = 0;                                                                               \
+            PT_START(t4);                                                                                                \
             for (int64_t j = k1 - 1; j >= k0; j--) {  /* the block's triangle: x_j /= U_jj, then the rows k0 .. j-1 */  \
                 const T d = Ux[pl->udiag[j]];                                                                            \
                 for (int64_t r = 0; r < nrhs; r++) x[j + r * ldx] = x[j + r * ldx] / d;                                  \
@@ -238,13 +280,15 @@ static void bwdU_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t nr
                     for (int64_t r = 0; r < nrhs; r++) {                                                                 \
                         T *xr = x + r * ldx; const T xj = xr[j];                                                         \
                         if (xj == 0) continue;                                                                           \
-                        for (int64_t i = a0; i < a1; i++) xr[i] -= xj * v[i - a0];                                       \
+                        for (int64_t i = a0; i < a1; i++) FMS_##SUF(xr[i], xj, v[i - a0]);                                       \
                     }                                                                                                    \
                 }                                                                                                        \
             }                                                                                                            \
+            PT_ADD(t4, 4, (k1 - k0) * (k1 - k0 - 1) / 2);                                                                \
             if (lo_row >= k0) continue;                                                                                  \
+            PT_START(t5);                                                                                                \
             /* the rows above the block, lo_row .. k0-1, by row range; each range finds its segments by bisection */     \
-            const int64_t span = k0 - lo_row, cs = plan_chunk(span), nch = (span + cs - 1) / cs;                                \
+            const int64_t span = k0 - lo_row, cs = plan_chunk(span, pl->chunk_min), nch = (span + cs - 1) / cs;                                \
             const int par = nch > 1 && work * nrhs >= PLAN_PAR_MIN; (void)par;                                                      \
             PLAN_OMP("omp parallel for schedule(dynamic, 1) if (par)")                                                    \
             for (int64_t ch = 0; ch < nch; ch++) {                                                                       \
@@ -264,11 +308,12 @@ static void bwdU_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t nr
                         for (int64_t r = 0; r < nrhs; r++) {                                                             \
                             T *xr = x + r * ldx; const T xj = xr[j];                                                     \
                             if (xj == 0) continue;                                                                       \
-                            for (int64_t i = a0; i < a1; i++) xr[i] -= xj * v[i - a0];                                   \
+                            for (int64_t i = a0; i < a1; i++) FMS_##SUF(xr[i], xj, v[i - a0]);                                   \
                         }                                                                                                \
                     }                                                                                                    \
                 }                                                                                                        \
             }                                                                                                            \
+            PT_ADD(t5, par ? 5 : 6, work);                                                                               \
         }                                                                                                                \
     }                                                                                                                    \
 }                                                                                                                        \
@@ -280,8 +325,8 @@ static void fwdUt_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t n
     const int64_t *sp = pl->useg_ptr, *srow = pl->useg_row, *slen = pl->useg_len, *soff = pl->useg_off;                  \
     for (int64_t s = 0; s < pl->nsn; s++) {                                                                              \
         const int64_t c0 = pl->sn[s], c1 = pl->sn[s + 1];                                                                \
-        for (int64_t k0 = c0; k0 < c1; k0 += PLAN_BLOCK) {                                                               \
-            const int64_t k1 = min_i64(k0 + PLAN_BLOCK, c1);                                                             \
+        for (int64_t k0 = c0; k0 < c1; k0 += pl->block) {                                                               \
+            const int64_t k1 = min_i64(k0 + pl->block, c1);                                                             \
             int64_t work = 0;                                                                                            \
             for (int64_t k = sp[k0]; k < sp[k1]; k++) work += slen[k];                                                   \
             const int par = (k1 - k0) > 1 && work * nrhs >= PLAN_PAR_MIN; (void)par;                                                \
@@ -293,8 +338,8 @@ static void fwdUt_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t n
                     for (int64_t k = sp[j]; k < sp[j + 1]; k++) {                                                        \
                         const int64_t a1 = min_i64(srow[k] + slen[k], k0);                                               \
                         const T *v = Ux + soff[k];                                                                       \
-                        if (cj) { for (int64_t i = srow[k]; i < a1; i++) acc -= CJ(v[i - srow[k]]) * xr[i]; }            \
-                        else    { for (int64_t i = srow[k]; i < a1; i++) acc -= v[i - srow[k]] * xr[i]; }                \
+                        if (cj) { for (int64_t i = srow[k]; i < a1; i++) FMS_##SUF(acc, CJ(v[i - srow[k]]), xr[i]); }            \
+                        else    { for (int64_t i = srow[k]; i < a1; i++) FMS_##SUF(acc, v[i - srow[k]], xr[i]); }                \
                     }                                                                                                    \
                     part[(j - k0) * nrhs + r] = acc;                                                                     \
                 }                                                                                                        \
@@ -306,8 +351,8 @@ static void fwdUt_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t n
                     for (int64_t k = sp[j]; k < sp[j + 1]; k++) {                                                        \
                         const int64_t a0 = max_i64(srow[k], k0), a1 = srow[k] + slen[k];                                 \
                         const T *v = Ux + soff[k];                                                                       \
-                        if (cj) { for (int64_t i = a0; i < a1; i++) acc -= CJ(v[i - srow[k]]) * xr[i]; }                 \
-                        else    { for (int64_t i = a0; i < a1; i++) acc -= v[i - srow[k]] * xr[i]; }                     \
+                        if (cj) { for (int64_t i = a0; i < a1; i++) FMS_##SUF(acc, CJ(v[i - srow[k]]), xr[i]); }                 \
+                        else    { for (int64_t i = a0; i < a1; i++) FMS_##SUF(acc, v[i - srow[k]], xr[i]); }                     \
                     }                                                                                                    \
                     xr[j] = acc / d;                                                                                     \
                 }                                                                                                        \
@@ -329,15 +374,15 @@ static void bwdLt_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int
                     T *xr = x + r * ldx; T acc = xr[j];                                                                  \
                     for (int64_t q = Lp[j]; q < Lp[j + 1]; q++) {                                                        \
                         const int64_t i = Li[q];                                                                         \
-                        if (i > j) acc -= (cj ? CJ(Lx[q]) : Lx[q]) * xr[i];                                              \
+                        if (i > j) FMS_##SUF(acc, (cj ? CJ(Lx[q]) : Lx[q]), xr[i]);                                              \
                     }                                                                                                    \
                     xr[j] = acc;                                                                                         \
                 }                                                                                                        \
             continue;                                                                                                    \
         }                                                                                                                \
         const int64_t *R = Li + Lp[c1 - 1] + 1, m = Lp[c1] - Lp[c1 - 1] - 1;                                            \
-        for (int64_t k1 = c1; k1 > c0; k1 -= PLAN_BLOCK) {                                                               \
-            const int64_t k0 = max_i64(k1 - PLAN_BLOCK, c0), nt = c1 - k1, nb = nt + m;                                  \
+        for (int64_t k1 = c1; k1 > c0; k1 -= pl->block) {                                                               \
+            const int64_t k0 = max_i64(k1 - pl->block, c0), nt = c1 - k1, nb = nt + m;                                  \
             const int par = (k1 - k0) > 1 && nb * (k1 - k0) * nrhs >= PLAN_PAR_MIN; (void)par;                                      \
             PLAN_OMP("omp parallel for schedule(dynamic, 4) if (par)")                                                    \
             for (int64_t j = k0; j < k1; j++) {    /* rows below the block: k1 .. c1-1, then R (all final) */            \
@@ -346,11 +391,11 @@ static void bwdLt_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int
                     const T *xr = x + r * ldx;                                                                           \
                     T acc = 0;                                                                                           \
                     if (cj) {                                                                                            \
-                        for (int64_t p = 0; p < nt; p++) acc -= CJ(v[p]) * xr[k1 + p];                                   \
-                        for (int64_t p = nt; p < nb; p++) acc -= CJ(v[p]) * xr[R[p - nt]];                               \
+                        for (int64_t p = 0; p < nt; p++) FMS_##SUF(acc, CJ(v[p]), xr[k1 + p]);                                   \
+                        for (int64_t p = nt; p < nb; p++) FMS_##SUF(acc, CJ(v[p]), xr[R[p - nt]]);                               \
                     } else {                                                                                             \
-                        for (int64_t p = 0; p < nt; p++) acc -= v[p] * xr[k1 + p];                                       \
-                        for (int64_t p = nt; p < nb; p++) acc -= v[p] * xr[R[p - nt]];                                   \
+                        for (int64_t p = 0; p < nt; p++) FMS_##SUF(acc, v[p], xr[k1 + p]);                                       \
+                        for (int64_t p = nt; p < nb; p++) FMS_##SUF(acc, v[p], xr[R[p - nt]]);                                   \
                     }                                                                                                    \
                     part[(j - k0) * nrhs + r] = acc;                                                                     \
                 }                                                                                                        \
@@ -360,8 +405,8 @@ static void bwdLt_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int
                 for (int64_t r = 0; r < nrhs; r++) {                                                                     \
                     T *xr = x + r * ldx;                                                                                 \
                     T acc = xr[j];                                                                                       \
-                    if (cj) { for (int64_t i = j + 1; i < k1; i++) acc -= CJ(v[i - j - 1]) * xr[i]; }                    \
-                    else    { for (int64_t i = j + 1; i < k1; i++) acc -= v[i - j - 1] * xr[i]; }                        \
+                    if (cj) { for (int64_t i = j + 1; i < k1; i++) FMS_##SUF(acc, CJ(v[i - j - 1]), xr[i]); }                    \
+                    else    { for (int64_t i = j + 1; i < k1; i++) FMS_##SUF(acc, v[i - j - 1], xr[i]); }                        \
                     xr[j] = acc + part[(j - k0) * nrhs + r];                                                             \
                 }                                                                                                        \
             }                                                                                                            \
@@ -398,9 +443,20 @@ int fplus_tri_solve_plan(const fplus_solve_plan *pl, int64_t n, const int64_t *L
                           bwdU_z(pl, (const double complex *)Ux, (double complex *)x, nrhs, ldx); }
         else            { fwdL_d(pl, Lp, Li, (const double *)Lx, (double *)x, nrhs, ldx);
                           bwdU_d(pl, (const double *)Ux, (double *)x, nrhs, ldx); }
+#if defined(PLAN_PROFILE) && defined(_OPENMP)
+        {
+            static const char *nm[7] = {"L plain-sweep supernodes", "L triangles", "L updates, threaded", "L updates, one thread",
+                                        "U triangles + segment scan", "U updates, threaded", "U updates, one thread"};
+            fprintf(stderr, "[plan] %d threads, %ld supernodes:\n", omp_get_max_threads(), (long)pl->nsn);
+            for (int k = 0; k < 7; k++) {
+                fprintf(stderr, "[plan]   %-28s %8.4f s  %10.3e entries\n", nm[k], plan_t[k], plan_e[k]);
+                plan_t[k] = 0; plan_e[k] = 0;
+            }
+        }
+#endif
         return FPLUS_OK;
     }
-    void *part = malloc((size_t)(PLAN_BLOCK * nrhs) * vs);
+    void *part = malloc((size_t)(pl->block * nrhs) * vs);
     if (!part) return FPLUS_ERR_NOMEM;
     const int cj = trans == 2;
     if (is_complex) { fwdUt_z(pl, (const double complex *)Ux, (double complex *)x, nrhs, ldx, cj, (double complex *)part);

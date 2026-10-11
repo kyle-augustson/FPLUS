@@ -33,6 +33,7 @@ import sys
 import shlex
 import numpy as np
 from setuptools import setup, Extension
+from setuptools.command.build_ext import build_ext
 
 use_openmp = os.environ.get("SPARSE_LU_OPENMP", "0") == "1"
 use_blas   = os.environ.get("SPARSE_LU_BLAS",   "0") == "1"
@@ -106,6 +107,24 @@ ext = Extension(
     language="c",
 )
 
+# The triangular solves are compiled without floating-point contraction: every operation rounds as written, so the blocked solves
+# (src/solve_plan.c, written-out complex products) give the same bits as the plain sweeps (src/solve.c, C99 products) and the
+# CMake build; the factorization keeps the extension's flags.
+NOCONTRACT_SOURCES = ["src/solve.c", "src/solve_plan.c"]
+
+
+class build_ext_nocontract(build_ext):
+    def build_extension(self, ext):
+        special = [src for src in ext.sources if src in NOCONTRACT_SOURCES]
+        if special and self.compiler.compiler_type != "msvc":     # MSVC does not contract without /fp:fast or /fp:contract
+            objs = self.compiler.compile(special, output_dir=self.build_temp, macros=ext.define_macros, include_dirs=ext.include_dirs,
+                                         debug=self.debug, extra_postargs=list(ext.extra_compile_args or []) + ["-ffp-contract=off"],
+                                         depends=ext.depends)
+            ext.sources = [src for src in ext.sources if src not in NOCONTRACT_SOURCES]
+            ext.extra_objects = list(ext.extra_objects or []) + objs
+        super().build_extension(ext)
+
+
 omp_note  = " (OpenMP enabled)" if use_openmp else \
             " (set SPARSE_LU_OPENMP=1 to enable OpenMP)"
 blas_note = " (BLAS enabled)"   if use_blas   else \
@@ -117,6 +136,7 @@ print(f"Building _sparse_lu_c{omp_note}{blas_note} (COLAMD: {ss_lib})")
 # taking src/ (the C sources) for the package directory.
 setup(
     ext_modules=[ext],
+    cmdclass={"build_ext": build_ext_nocontract},
     package_dir={"": "."},
     packages=[],
     py_modules=[],
