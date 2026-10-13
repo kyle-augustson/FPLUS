@@ -172,9 +172,31 @@ int fplus_ruiz(int64_t n, const int64_t *indptr, const int64_t *indices, void *d
         if (amax > 0.0 && (amax > 0x1p500 || amin < 0x1p-500)) {
             int emax = ilogb(amax), emin = ilogb(amin);
             if (emax - emin > 990) {
-                fplus_errf(err, errlen, "entries span 2^%d .. 2^%d: wider than Ruiz equilibration can handle in double precision",
-                           emin, emax);
-                return FPLUS_ERR_BADARG;
+                /* The iteration is set by the line maxima: an entry far below its row's and column's largest only gets smaller
+                 * (and its square underflowing to 0 is harmless), so the span that matters runs from the smallest row or column
+                 * maximum to amax.  A Dedalus 64 x 192 pencil had a few entries near 2^-1073 among O(1) ones (2026-10-12);
+                 * the global minimum then refused a matrix Ruiz handles.  Only reached where the global test fails, so
+                 * every input accepted before takes the same path (bit-identical). */
+                double *lmax = (double *)calloc((size_t)(2 * (n > 0 ? n : 1)), sizeof(double));
+                if (!lmax) { fplus_errf(err, errlen, "out of memory"); return FPLUS_ERR_NOMEM; }
+                for (int64_t j = 0; j < n; j++)
+                    for (int64_t p = indptr[j]; p < indptr[j + 1]; p++) {
+                        const int64_t i = indices[p];
+                        double a = is_complex ? fmax(fabs(d[2 * p]), fabs(d[2 * p + 1])) : fabs(d[p]);
+                        const int64_t r = is_csc ? i : j, c = is_csc ? j : i;     /* row and column of the entry */
+                        if (a > lmax[r]) lmax[r] = a;
+                        if (a > lmax[n + c]) lmax[n + c] = a;
+                    }
+                double lmin = INFINITY;
+                for (int64_t q = 0; q < 2 * n; q++) if (lmax[q] > 0.0 && lmax[q] < lmin) lmin = lmax[q];
+                free(lmax);
+                const int elmin = ilogb(lmin);
+                if (emax - elmin > 990) {
+                    fplus_errf(err, errlen, "line maxima span 2^%d .. 2^%d (entries 2^%d ..): wider than Ruiz equilibration can handle "
+                               "in double precision; factor without equilibration (equilibrate=False)", elmin, emax, emin);
+                    return FPLUS_ERR_BADARG;
+                }
+                emin = elmin;
             }
             k4 = -((emax + emin) / 2 / 4) * 4;
             const double sc = ldexp(1.0, k4);
