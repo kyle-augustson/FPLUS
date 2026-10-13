@@ -102,18 +102,17 @@ If the C extension is not built, the library falls back to a pure-Python
 implementation that is correct but much slower (and only supports
 `pivot_strategy='full'`).
 
-## Optional: install SuiteSparse COLAMD
+## SuiteSparse COLAMD and AMD (required)
 
-The COLAMD-based variants prefer to call SuiteSparse's `colamd_l` directly
-via ctypes for int64 support. On Ubuntu/Debian:
+The C ordering links SuiteSparse COLAMD and AMD at build time (`colamd.h`, `amd.h`, `libcolamd`, `libamd`; setup.py looks
+in `SUITESPARSE_INCLUDE_DIR` / `SUITESPARSE_LIB_DIR`, else the environment's prefix, else the system locations; CMake finds
+the SuiteSparse packages).  On Ubuntu/Debian:
 
 ```bash
 sudo apt-get install libsuitesparse-dev
 ```
 
-If `libcolamd.so` is not available, the library falls back to extracting the
-COLAMD ordering through scipy's SuperLU interface, which works but is subject
-to int32 limits on the structural matrix size.
+AMD supplies the minimum-degree ordering on A^T A (`ordering="amd_ata"`, and `"auto"` for small sparse matrices).
 
 ## Optional: install BLAS development headers
 
