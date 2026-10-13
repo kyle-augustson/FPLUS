@@ -332,8 +332,8 @@ def sparse_lu_full_pivot(
 
     cache_ordering : bool, optional
         Reuse the COLAMD ordering of an earlier call with the same sparsity
-        pattern and pinning parameters (an LRU of 8; the ordering depends
-        on nothing else, so this is exact).  Default True;
+        pattern and pinning parameters (an LRU bounded at 64 MB; the
+        ordering depends on nothing else, so this is exact).  Default True;
         clear_ordering_cache() empties it.
 
     panel : int, optional
@@ -926,14 +926,24 @@ def _colamd_ordering(A_csr: csr_matrix, n: int,
 _ORDER_CACHE: "OrderedDict" = None
 import threading as _threading
 _ORDER_CACHE_LOCK = _threading.Lock()
-_ORDER_CACHE_MAX = 8
+# Bounded by memory, not by count: a Dedalus / Rayleigh rank holds ~50 pencils with a pattern per ell, refactored at every
+# dt change; a count of 8 made every refactorization re-analyse (2026-10-13).  An entry is its two orders plus, for
+# patterns verified by their row indices, those indices (~0.2 MB at n 1952).
+_ORDER_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_ORDER_CACHE_MAX_ENTRIES = 4096
+_ORDER_CACHE_BYTES = 0
+
+
+def _order_entry_bytes(hit):
+    return sum(a.nbytes for a in (hit[0], hit[1], hit[4]) if isinstance(a, np.ndarray))
 
 
 def clear_ordering_cache():
     """Forget every cached COLAMD ordering."""
-    global _ORDER_CACHE
+    global _ORDER_CACHE, _ORDER_CACHE_BYTES
     with _ORDER_CACHE_LOCK:
         _ORDER_CACHE = None
+        _ORDER_CACHE_BYTES = 0
 
 
 # Patterns up to this many entries are keyed by a fingerprint (indptr and a sample of the row indices) and verified
@@ -964,7 +974,7 @@ _ORDERINGS = {"colamd": 0, "amd_ata": 1, "auto": 2}
 def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, cache=True, postorder=False,
                          ordering="colamd"):
     """_colamd_permutations_uncached, cached by sparsity pattern (cache=True)."""
-    global _ORDER_CACHE
+    global _ORDER_CACHE, _ORDER_CACHE_BYTES
     if not cache:
         return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder, ordering)
     from collections import OrderedDict
@@ -985,11 +995,15 @@ def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row
         hit = tuple(hit) + ((Ac.indices.copy() if Ac.nnz <= _ORDER_CACHE_VERIFY_NNZ else None),)
         with _ORDER_CACHE_LOCK:
             if _ORDER_CACHE is None:
-                _ORDER_CACHE = OrderedDict()
+                _ORDER_CACHE = OrderedDict(); _ORDER_CACHE_BYTES = 0
+            old = _ORDER_CACHE.get(key)
+            if old is not None:
+                _ORDER_CACHE_BYTES -= _order_entry_bytes(old)
             _ORDER_CACHE[key] = hit
+            _ORDER_CACHE_BYTES += _order_entry_bytes(hit)
             _ORDER_CACHE.move_to_end(key)
-            while len(_ORDER_CACHE) > _ORDER_CACHE_MAX:
-                _ORDER_CACHE.popitem(last=False)
+            while len(_ORDER_CACHE) > 1 and (len(_ORDER_CACHE) > _ORDER_CACHE_MAX_ENTRIES or _ORDER_CACHE_BYTES > _ORDER_CACHE_MAX_BYTES):
+                _ORDER_CACHE_BYTES -= _order_entry_bytes(_ORDER_CACHE.popitem(last=False)[1])
     return hit[0].copy(), hit[1].copy(), hit[2], hit[3]
 
 
