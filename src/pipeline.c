@@ -26,25 +26,54 @@ static int permute_csc(int64_t n, const int64_t *Ap, const int64_t *Ai, const vo
     Bp[0] = 0;
     for (int64_t jj = 0; jj < n; jj++) { int64_t c = col_perm[jj]; Bp[jj + 1] = Bp[jj] + (Ap[c + 1] - Ap[c]); }
     int bad = 0;
+    if (fplus_omp_active() && n >= 20000) {
+        /* many threads, a large matrix: each column sorted on its own (rows distinct: the order is unique) */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 64) reduction(|:bad)
 #endif
-    for (int64_t jj = 0; jj < n; jj++) {
-        const int64_t c = col_perm[jj], a0 = Ap[c], len = Ap[c + 1] - a0, b0 = Bp[jj];
-        if (identity) {
-            memcpy(Bi + b0, Ai + a0, (size_t)len * sizeof(int64_t));
-            memcpy((char *)Bx + (size_t)b0 * vs, (const char *)Ax + (size_t)a0 * vs, (size_t)len * vs);
-            continue;
+        for (int64_t jj = 0; jj < n; jj++) {
+            const int64_t c = col_perm[jj], a0 = Ap[c], len = Ap[c + 1] - a0, b0 = Bp[jj];
+            if (identity) {
+                memcpy(Bi + b0, Ai + a0, (size_t)len * sizeof(int64_t));
+                memcpy((char *)Bx + (size_t)b0 * vs, (const char *)Ax + (size_t)a0 * vs, (size_t)len * vs);
+                continue;
+            }
+            RowSrc *rs = (RowSrc *)malloc((size_t)(len > 0 ? len : 1) * sizeof(RowSrc));
+            if (!rs) { bad = 1; continue; }
+            for (int64_t k = 0; k < len; k++) { rs[k].r = inv[Ai[a0 + k]]; rs[k].src = a0 + k; }
+            qsort(rs, (size_t)len, sizeof(RowSrc), rowsrc_cmp);   /* the row indices are distinct: the order is unique */
+            for (int64_t k = 0; k < len; k++) {
+                Bi[b0 + k] = rs[k].r;
+                memcpy((char *)Bx + (size_t)(b0 + k) * vs, (const char *)Ax + (size_t)rs[k].src * vs, vs);
+            }
+            free(rs);
         }
-        RowSrc *rs = (RowSrc *)malloc((size_t)(len > 0 ? len : 1) * sizeof(RowSrc));
-        if (!rs) { bad = 1; continue; }
-        for (int64_t k = 0; k < len; k++) { rs[k].r = inv[Ai[a0 + k]]; rs[k].src = a0 + k; }
-        qsort(rs, (size_t)len, sizeof(RowSrc), rowsrc_cmp);   /* the row indices are distinct: the order is unique */
-        for (int64_t k = 0; k < len; k++) {
-            Bi[b0 + k] = rs[k].r;
-            memcpy((char *)Bx + (size_t)(b0 + k) * vs, (const char *)Ax + (size_t)rs[k].src * vs, vs);
+    } else {
+        /* one thread (or a small matrix): two counting-sort passes, O(nnz) and no allocation per column -- the columns in
+           col_perm order with their rows renumbered, transposed (rows ascending by construction), transposed back.  The
+           same arrays as the per-column sort (the rows in a column are distinct). */
+        int64_t *Tp = (int64_t *)calloc((size_t)(n + 1), sizeof(int64_t));
+        int64_t *Tj = (int64_t *)malloc((size_t)(nnz > 0 ? nnz : 1) * sizeof(int64_t));
+        int64_t *Ts = (int64_t *)malloc((size_t)(nnz > 0 ? nnz : 1) * sizeof(int64_t));
+        int64_t *fill = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+        if (!Tp || !Tj || !Ts || !fill) { free(Tp); free(Tj); free(Ts); free(fill); bad = 1; }
+        else {
+            for (int64_t q = 0; q < nnz; q++) Tp[inv[Ai[q]] + 1]++;
+            for (int64_t i = 0; i < n; i++) Tp[i + 1] += Tp[i];
+            memcpy(fill, Tp, (size_t)(n + 1) * sizeof(int64_t));
+            for (int64_t jj = 0; jj < n; jj++) {       /* row-major: (new row) -> (new column jj, source position) */
+                const int64_t c = col_perm[jj];
+                for (int64_t q = Ap[c]; q < Ap[c + 1]; q++) { int64_t t = fill[inv[Ai[q]]]++; Tj[t] = jj; Ts[t] = q; }
+            }
+            memcpy(fill, Bp, (size_t)(n + 1) * sizeof(int64_t));
+            for (int64_t r = 0; r < n; r++)          /* back to columns, rows ascending */
+                for (int64_t t = Tp[r]; t < Tp[r + 1]; t++) {
+                    int64_t o = fill[Tj[t]]++;
+                    Bi[o] = r;
+                    memcpy((char *)Bx + (size_t)o * vs, (const char *)Ax + (size_t)Ts[t] * vs, vs);
+                }
+            free(Tp); free(Tj); free(Ts); free(fill);
         }
-        free(rs);
     }
     free(inv);
     if (bad) { free(Bp); free(Bi); free(Bx); return FPLUS_ERR_NOMEM; }

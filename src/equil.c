@@ -92,32 +92,57 @@ static int64_t ruiz_csc_iter(void *data, const int64_t *indices, const int64_t *
     }
     if (is_complex) {
         double complex *zd = (double complex *)data;
+        if (fplus_omp_active()) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int64_t j = 0; j < n; j++) {
-            double cm = 0.0;
-            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
-                zd[p] *= row_max[indices[p]];
-                double re = creal(zd[p]), im = cimag(zd[p]);
-                double av = re * re + im * im;
-                if (av > cm) cm = av;
+            for (int64_t j = 0; j < n; j++) {
+                double cm = 0.0;
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                    zd[p] *= row_max[indices[p]];
+                    double re = creal(zd[p]), im = cimag(zd[p]);
+                    double av = re * re + im * im;
+                    if (av > cm) cm = av;
+                }
+                col_max[j] = cm;
             }
-            col_max[j] = cm;
+        } else {
+            for (int64_t j = 0; j < n; j++) {
+                double cm = 0.0;
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                    zd[p] *= row_max[indices[p]];
+                    double re = creal(zd[p]), im = cimag(zd[p]);
+                    double av = re * re + im * im;
+                    if (av > cm) cm = av;
+                }
+                col_max[j] = cm;
+            }
         }
     } else {
         double *dd = (double *)data;
+        if (fplus_omp_active()) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int64_t j = 0; j < n; j++) {
-            double cm = 0.0;
-            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
-                dd[p] *= row_max[indices[p]];
-                double av = dd[p] * dd[p];
-                if (av > cm) cm = av;
+            for (int64_t j = 0; j < n; j++) {
+                double cm = 0.0;
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                    dd[p] *= row_max[indices[p]];
+                    double av = dd[p] * dd[p];
+                    if (av > cm) cm = av;
+                }
+                col_max[j] = cm;
             }
-            col_max[j] = cm;
+        } else {
+            for (int64_t j = 0; j < n; j++) {
+                double cm = 0.0;
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) {
+                    dd[p] *= row_max[indices[p]];
+                    double av = dd[p] * dd[p];
+                    if (av > cm) cm = av;
+                }
+                col_max[j] = cm;
+            }
         }
     }
     for (int64_t j = 0; j < n; j++)
@@ -130,18 +155,28 @@ static int64_t ruiz_csc_iter(void *data, const int64_t *indices, const int64_t *
     }
     if (is_complex) {
         double complex *zd = (double complex *)data;
+        if (fplus_omp_active()) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int64_t j = 0; j < n; j++)
-            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) zd[p] *= col_max[j];
+            for (int64_t j = 0; j < n; j++)
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) zd[p] *= col_max[j];
+        } else {
+            for (int64_t j = 0; j < n; j++)
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) zd[p] *= col_max[j];
+        }
     } else {
         double *dd = (double *)data;
+        if (fplus_omp_active()) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int64_t j = 0; j < n; j++)
-            for (int64_t p = indptr[j]; p < indptr[j+1]; p++) dd[p] *= col_max[j];
+            for (int64_t j = 0; j < n; j++)
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) dd[p] *= col_max[j];
+        } else {
+            for (int64_t j = 0; j < n; j++)
+                for (int64_t p = indptr[j]; p < indptr[j+1]; p++) dd[p] *= col_max[j];
+        }
     }
     *res_out = res;
     return 0;
@@ -254,30 +289,53 @@ int fplus_ruiz(int64_t n, const int64_t *indptr, const int64_t *indices, void *d
         for (int64_t j = 0; j < n; j++) col_max[j] = 0.0;
         if (is_complex) {
             double complex *zd = (double complex *)data;
+            if (fplus_omp_active()) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int64_t i = 0; i < n; i++) {
-                double rm = 0.0;
-                for (int64_t p = indptr[i]; p < indptr[i+1]; p++) {
-                    double re = creal(zd[p]), im = cimag(zd[p]);
-                    double av = re * re + im * im;
-                    if (av > rm) rm = av;
+                for (int64_t i = 0; i < n; i++) {
+                    double rm = 0.0;
+                    for (int64_t p = indptr[i]; p < indptr[i+1]; p++) {
+                        double re = creal(zd[p]), im = cimag(zd[p]);
+                        double av = re * re + im * im;
+                        if (av > rm) rm = av;
+                    }
+                    row_max[i] = rm;
                 }
-                row_max[i] = rm;
+            } else {
+                for (int64_t i = 0; i < n; i++) {
+                    double rm = 0.0;
+                    for (int64_t p = indptr[i]; p < indptr[i+1]; p++) {
+                        double re = creal(zd[p]), im = cimag(zd[p]);
+                        double av = re * re + im * im;
+                        if (av > rm) rm = av;
+                    }
+                    row_max[i] = rm;
+                }
             }
         } else {
             double *dd = (double *)data;
+            if (fplus_omp_active()) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int64_t i = 0; i < n; i++) {
-                double rm = 0.0;
-                for (int64_t p = indptr[i]; p < indptr[i+1]; p++) {
-                    double av = dd[p] * dd[p];
-                    if (av > rm) rm = av;
+                for (int64_t i = 0; i < n; i++) {
+                    double rm = 0.0;
+                    for (int64_t p = indptr[i]; p < indptr[i+1]; p++) {
+                        double av = dd[p] * dd[p];
+                        if (av > rm) rm = av;
+                    }
+                    row_max[i] = rm;
                 }
-                row_max[i] = rm;
+            } else {
+                for (int64_t i = 0; i < n; i++) {
+                    double rm = 0.0;
+                    for (int64_t p = indptr[i]; p < indptr[i+1]; p++) {
+                        double av = dd[p] * dd[p];
+                        if (av > rm) rm = av;
+                    }
+                    row_max[i] = rm;
+                }
             }
         }
         for (int64_t i = 0; i < n; i++) {

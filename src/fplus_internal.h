@@ -72,6 +72,18 @@ extern void cblas_zgemv(int order, int trans, int M, int N, const void *alpha,
 #    define SN_BLAS_MIN 256   /* segment columns x rest rows below which the loops are used */
 #  endif
 #endif
+/* OpenMP regions only when more than one thread may run them.  An inactive region still costs a runtime call, and Cray's
+ * OpenMP runtime (libsci_cray_mp) aborts the process when a region is opened from a thread it did not create (FPLUS called
+ * from several Python threads), even with one thread. */
+static inline int fplus_omp_active(void)
+{
+#ifdef _OPENMP
+    return omp_get_max_threads() > 1;
+#else
+    return 0;
+#endif
+}
+
 #ifndef SN_PAR_MIN
 #  define SN_PAR_MIN 16384   /* entries below which the gather / scatter / L-store loops stay serial (OpenMP) */
 #endif
