@@ -145,6 +145,15 @@ int fplus_solve_plan_create(int64_t n, const int64_t *Lp, const int64_t *Li, con
         }
     }
     pl->useg_ptr[n] = nseg;
+    {   /* plain or blocked sweeps (FPLUS_PLAN_PLAIN=0/1 forces one, for experiments) */
+        const int64_t nseg_rows = Up[n] - n;   /* the off-diagonal entries of U (every column holds its diagonal: checked below) */
+        for (int64_t j = 0; j < n && !odd; j++)        /* L: below the diagonal after it */
+            for (int64_t q = Lp[j] + 1; q < Lp[j + 1]; q++) if (Li[q] <= j) { odd++; break; }
+        pl->plain = !odd && Lp[n] + Up[n] < PLAN_PLAIN_NNZ && (nseg == 0 || nseg_rows < (int64_t)PLAN_PLAIN_SEG * nseg);
+        const char *e = getenv("FPLUS_PLAN_PLAIN");
+        if (e && (e[0] == '0' || e[0] == '1')) pl->plain = !odd && e[0] == '1';
+    }
+    if (pl->plain) { *out = pl; return FPLUS_OK; }   /* the plain sweeps need udiag only: no segment lists */
     const size_t sz = (size_t)(nseg > 0 ? nseg : 1) * sizeof(int64_t);
     pl->useg_row = (int64_t *)malloc(sz); pl->useg_len = (int64_t *)malloc(sz);
     pl->useg_off = (int64_t *)malloc(sz); pl->useg_srt = (int64_t *)malloc(sz);
@@ -160,14 +169,6 @@ int fplus_solve_plan_create(int64_t n, const int64_t *Lp, const int64_t *Li, con
             prev = i;
         }
         if (pl->useg_ptr[j + 1] - pl->useg_ptr[j] > maxseg) maxseg = pl->useg_ptr[j + 1] - pl->useg_ptr[j];
-    }
-    {   /* plain or blocked sweeps (FPLUS_PLAN_PLAIN=0/1 forces one, for experiments) */
-        const int64_t nseg_rows = Up[n] - n;   /* the off-diagonal entries of U (every column holds its diagonal: checked below) */
-        for (int64_t j = 0; j < n && !odd; j++)        /* L: below the diagonal after it */
-            for (int64_t q = Lp[j] + 1; q < Lp[j + 1]; q++) if (Li[q] <= j) { odd++; break; }
-        pl->plain = !odd && Lp[n] + Up[n] < PLAN_PLAIN_NNZ && (nseg == 0 || nseg_rows < (int64_t)PLAN_PLAIN_SEG * nseg);
-        const char *e = getenv("FPLUS_PLAN_PLAIN");
-        if (e && (e[0] == '0' || e[0] == '1')) pl->plain = e[0] == '1';
     }
     SegKey *key = (SegKey *)malloc((size_t)(maxseg > 0 ? maxseg : 1) * sizeof(SegKey));
     if (!key) goto oom;

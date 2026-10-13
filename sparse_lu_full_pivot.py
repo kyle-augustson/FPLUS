@@ -920,13 +920,23 @@ def clear_ordering_cache():
         _ORDER_CACHE = None
 
 
+# Patterns up to this many entries are keyed by a fingerprint (indptr and a sample of the row indices) and verified
+# against a stored copy of their row indices on every hit: exact, and ~20x cheaper than hashing every index (0.5 ms of a
+# 5.6 ms refactorization at n 1952, 2026-10-12).  Larger patterns are keyed by a hash of all their indices.
+_ORDER_CACHE_VERIFY_NNZ = 4_000_000
+
+
 def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask):
     import hashlib
     A_csr = _canonical_csc(A)        # (the name is historical: the key is taken on canonical CSC)
     h = hashlib.blake2b(digest_size=20)
     h.update(b"csc")
     h.update(np.ascontiguousarray(A_csr.indptr, dtype=np.int64).tobytes())
-    h.update(np.ascontiguousarray(A_csr.indices, dtype=np.int64).tobytes())
+    if A_csr.nnz <= _ORDER_CACHE_VERIFY_NNZ:
+        step = max(1, A_csr.nnz // 4096)
+        h.update(b"sample:" + np.ascontiguousarray(A_csr.indices[::step], dtype=np.int64).tobytes())
+    else:
+        h.update(np.ascontiguousarray(A_csr.indices, dtype=np.int64).tobytes())
     for tag, m in ((b"row:", tau_row_mask), (b"col:", tau_col_mask)):   # tagged: the two masks cannot alias (audit 2026-10-10)
         h.update(tag + (b"none" if m is None else np.packbits(np.asarray(m, dtype=bool)).tobytes()))
     return (n, A_csr.nnz, bool(pin_dense_rows), float(tau_density), int(tau_min_nnz), h.hexdigest())
@@ -947,8 +957,12 @@ def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row
         hit = _ORDER_CACHE.get(key)
         if hit is not None:
             _ORDER_CACHE.move_to_end(key)
+    if hit is not None and hit[4] is not None and not np.array_equal(_canonical_csc(A).indices, hit[4]):
+        hit = None                   # a fingerprint shared by another pattern: analyse, and replace the entry
     if hit is None:
         hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
+        Ac = _canonical_csc(A)
+        hit = tuple(hit) + ((Ac.indices.copy() if Ac.nnz <= _ORDER_CACHE_VERIFY_NNZ else None),)
         with _ORDER_CACHE_LOCK:
             if _ORDER_CACHE is None:
                 _ORDER_CACHE = OrderedDict()
