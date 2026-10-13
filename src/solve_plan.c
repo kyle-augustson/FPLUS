@@ -51,6 +51,8 @@ struct fplus_solve_plan {
     int generic;                /* the L pattern lacks the layout (diagonal first in every column): plain sweeps */
     int plain;                  /* small factor, short U segments: the plain sweeps of PLAN_KERNELS (PLAN_PLAIN_NNZ / _SEG) */
     int64_t maxR;               /* longest R of a blocked (sn_par) supernode: the gather buffer of the one-thread L sweeps */
+    void *Li_c, *Ui_c;          /* plain plans: the row indices of L and U again, 16-bit when n <= 65536 (idx16), else 32-bit */
+    int idx16;
     int64_t nsn, *sn;           /* L supernode s: columns sn[s] .. sn[s+1]-1 */
     unsigned char *sn_par;      /* 1: the rows R are distinct and below the supernode (blocked, threaded); 0: plain sweeps */
     int64_t *useg_ptr;          /* U column j: segments useg_ptr[j] .. useg_ptr[j+1]-1 in storage order, rows < j only */
@@ -63,7 +65,7 @@ void fplus_solve_plan_free(fplus_solve_plan *pl)
 {
     if (!pl) return;
     free(pl->sn); free(pl->sn_par); free(pl->useg_ptr); free(pl->useg_row); free(pl->useg_len); free(pl->useg_off);
-    free(pl->useg_srt); free(pl->udiag); free(pl);
+    free(pl->useg_srt); free(pl->udiag); free(pl->Li_c); free(pl->Ui_c); free(pl);
 }
 
 int64_t fplus_solve_plan_nsupernodes(const fplus_solve_plan *pl) { return pl->generic ? -1 : pl->nsn; }
@@ -155,7 +157,19 @@ int fplus_solve_plan_create(int64_t n, const int64_t *Lp, const int64_t *Li, con
         const char *e = getenv("FPLUS_PLAN_PLAIN");
         if (e && (e[0] == '0' || e[0] == '1')) pl->plain = !odd && e[0] == '1';
     }
-    if (pl->plain) { *out = pl; return FPLUS_OK; }   /* the plain sweeps need udiag only: no segment lists */
+    if (pl->plain && n > INT32_MAX) pl->plain = 0;
+    if (pl->plain) {                       /* the plain sweeps read udiag and compact copies of the row indices: no segment lists */
+        const int64_t nl = Lp[n], nu = Up[n];
+        pl->idx16 = n <= 65536;
+        const size_t is = pl->idx16 ? sizeof(uint16_t) : sizeof(int32_t);
+        pl->Li_c = malloc((size_t)(nl > 0 ? nl : 1) * is); pl->Ui_c = malloc((size_t)(nu > 0 ? nu : 1) * is);
+        if (!pl->Li_c || !pl->Ui_c) goto oom;
+        if (pl->idx16) { uint16_t *a = (uint16_t *)pl->Li_c, *c = (uint16_t *)pl->Ui_c;
+                         for (int64_t q = 0; q < nl; q++) a[q] = (uint16_t)Li[q]; for (int64_t q = 0; q < nu; q++) c[q] = (uint16_t)Ui[q]; }
+        else           { int32_t *a = (int32_t *)pl->Li_c, *c = (int32_t *)pl->Ui_c;
+                         for (int64_t q = 0; q < nl; q++) a[q] = (int32_t)Li[q]; for (int64_t q = 0; q < nu; q++) c[q] = (int32_t)Ui[q]; }
+        *out = pl; return FPLUS_OK;
+    }
     const size_t sz = (size_t)(nseg > 0 ? nseg : 1) * sizeof(int64_t);
     pl->useg_row = (int64_t *)malloc(sz); pl->useg_len = (int64_t *)malloc(sz);
     pl->useg_off = (int64_t *)malloc(sz); pl->useg_srt = (int64_t *)malloc(sz);
@@ -232,43 +246,6 @@ static inline int64_t plan_chunk(int64_t rows, int64_t cmin)
     const int64_t cmax = cmin > PLAN_CHUNK ? cmin : PLAN_CHUNK;
     return c < cmin ? cmin : (c > cmax ? cmax : c);
 }
-
-/* the body of plainT_*: U^T then L^T, each column one dot product over its stored entries (U's diagonal skipped) */
-#define PLAIN_T_SWEEPS(SUF, T, OP)                                                                                       \
-    {                                                                                                                    \
-        const int64_t n = pl->n; const int64_t *ud = pl->udiag;                                                          \
-        if (nrhs == 1) {                       /* one right-hand side: no column loop (keeps acc and x[j] in registers) */ \
-            for (int64_t j = 0; j < n; j++) {                                                                            \
-                const int64_t qd = ud[j], q1 = Up[j + 1]; T acc = x[j];                                                  \
-                for (int64_t q = Up[j]; q < qd; q++) FMS_##SUF(acc, OP(Ux[q]), x[Ui[q]]);                                \
-                for (int64_t q = qd + 1; q < q1; q++) FMS_##SUF(acc, OP(Ux[q]), x[Ui[q]]);                               \
-                x[j] = acc / OP(Ux[qd]);                                                                                 \
-            }                                                                                                            \
-            for (int64_t j = n - 1; j >= 0; j--) {                                                                       \
-                const int64_t q1 = Lp[j + 1]; T acc = x[j];                                                              \
-                for (int64_t q = Lp[j] + 1; q < q1; q++) FMS_##SUF(acc, OP(Lx[q]), x[Li[q]]);                            \
-                x[j] = acc;                                                                                              \
-            }                                                                                                            \
-        } else {                                                                                                         \
-            for (int64_t j = 0; j < n; j++) {                                                                            \
-                const int64_t qd = ud[j], q0 = Up[j], q1 = Up[j + 1]; const T d = OP(Ux[qd]);                            \
-                for (int64_t r = 0; r < nrhs; r++) {                                                                     \
-                    T *xr = x + r * ldx; T acc = xr[j];                                                                  \
-                    for (int64_t q = q0; q < qd; q++) FMS_##SUF(acc, OP(Ux[q]), xr[Ui[q]]);                              \
-                    for (int64_t q = qd + 1; q < q1; q++) FMS_##SUF(acc, OP(Ux[q]), xr[Ui[q]]);                          \
-                    xr[j] = acc / d;                                                                                     \
-                }                                                                                                        \
-            }                                                                                                            \
-            for (int64_t j = n - 1; j >= 0; j--) {                                                                       \
-                const int64_t q0 = Lp[j] + 1, q1 = Lp[j + 1];                                                            \
-                for (int64_t r = 0; r < nrhs; r++) {                                                                     \
-                    T *xr = x + r * ldx; T acc = xr[j];                                                                  \
-                    for (int64_t q = q0; q < q1; q++) FMS_##SUF(acc, OP(Lx[q]), xr[Li[q]]);                              \
-                    xr[j] = acc;                                                                                         \
-                }                                                                                                        \
-            }                                                                                                            \
-        }                                                                                                                \
-    }
 
 #define PLAN_KERNELS(SUF, T, CJ)                                                                                         \
 /* L y = b: supernodes ascending, column blocks ascending */                                                             \
@@ -448,52 +425,6 @@ static void bwdU_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t nr
     }                                                                                                                    \
 }                                                                                                                        \
                                                                                                                          \
-/* the plain sweeps (pl->plain): one pass over each column in the order of fplus_tri_solve, the k right-hand sides sharing it; \
- * L's diagonal comes first in every column (the plan's layout) and U's sits at udiag */                                 \
-static void plainN_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int64_t *Li, const T *Lx, const int64_t *Up, \
-                         const int64_t *Ui, const T *Ux, T *x, int64_t nrhs, int64_t ldx)                                \
-{                                                                                                                        \
-    const int64_t n = pl->n; const int64_t *ud = pl->udiag;                                                              \
-    if (nrhs == 1) {                           /* one right-hand side: no column loop */                                 \
-        for (int64_t j = 0; j < n; j++) {                                                                                \
-            const T xj = x[j];                                                                                           \
-            if (xj == 0) continue;                                                                                       \
-            const int64_t q1 = Lp[j + 1];                                                                                \
-            for (int64_t q = Lp[j] + 1; q < q1; q++) FMS_##SUF(x[Li[q]], xj, Lx[q]);                                     \
-        }                                                                                                                \
-        for (int64_t j = n - 1; j >= 0; j--) {                                                                           \
-            const int64_t qd = ud[j], q1 = Up[j + 1]; const T xj = x[j] / Ux[qd];                                        \
-            x[j] = xj;                                                                                                   \
-            if (xj == 0) continue;                                                                                       \
-            for (int64_t q = Up[j]; q < qd; q++) FMS_##SUF(x[Ui[q]], xj, Ux[q]);                                         \
-            for (int64_t q = qd + 1; q < q1; q++) FMS_##SUF(x[Ui[q]], xj, Ux[q]);                                        \
-        }                                                                                                                \
-        return;                                                                                                          \
-    }                                                                                                                    \
-    for (int64_t j = 0; j < n; j++)                                                                                      \
-        for (int64_t r = 0; r < nrhs; r++) {                                                                             \
-            T *xr = x + r * ldx; const T xj = xr[j];                                                                     \
-            if (xj == 0) continue;                                                                                       \
-            for (int64_t q = Lp[j] + 1; q < Lp[j + 1]; q++) FMS_##SUF(xr[Li[q]], xj, Lx[q]);                             \
-        }                                                                                                                \
-    for (int64_t j = n - 1; j >= 0; j--) {                                                                               \
-        const int64_t qd = ud[j]; const T d = Ux[qd];                                                                    \
-        for (int64_t r = 0; r < nrhs; r++) {                                                                             \
-            T *xr = x + r * ldx; const T xj = xr[j] / d;                                                                 \
-            xr[j] = xj;                                                                                                  \
-            if (xj == 0) continue;                                                                                       \
-            for (int64_t q = Up[j]; q < qd; q++) FMS_##SUF(xr[Ui[q]], xj, Ux[q]);                                        \
-            for (int64_t q = qd + 1; q < Up[j + 1]; q++) FMS_##SUF(xr[Ui[q]], xj, Ux[q]);                                \
-        }                                                                                                                \
-    }                                                                                                                    \
-}                                                                                                                        \
-/* the transposed plain sweeps; OP(v) is the factor entry as used (itself, or its conjugate) */                           \
-static void plainT_##SUF(const fplus_solve_plan *pl, const int64_t *Lp, const int64_t *Li, const T *Lx, const int64_t *Up, \
-                         const int64_t *Ui, const T *Ux, T *x, int64_t nrhs, int64_t ldx, int cj)                        \
-{                                                                                                                        \
-    if (cj) PLAIN_T_SWEEPS(SUF, T, CJ) else PLAIN_T_SWEEPS(SUF, T, )                                                     \
-}                                                                                                                        \
-                                                                                                                         \
 /* U^T y = b (U^H when cj): column blocks ascending; the parts of the block's dot products over rows < k0 in parallel,   \
  * in storage order, then the rows in the block */                                                                       \
 static void fwdUt_##SUF(const fplus_solve_plan *pl, const T *Ux, T *x, int64_t nrhs, int64_t ldx, int cj, T *part)      \
@@ -634,6 +565,99 @@ static inline double conj_plan_d(double v) { return v; }
 PLAN_KERNELS(z, double complex, conj)
 PLAN_KERNELS(d, double, conj_plan_d)
 
+/* The plain sweeps (pl->plain), on the compact row indices (IT: uint16_t or int32_t).
+ * Forward (trans 0): one pass per column in the order of fplus_tri_solve (the same bits).
+ * Transposed: each column a dot product, summed in four interleaved partial sums (entries q, q+4, ... in the first, and so
+ * on; added (s0 + s1) + (s2 + s3), then x_j - s): the sums are independent, so the loads overlap instead of waiting on one
+ * running sum (one thread, a Rayleigh n 1952 pencil: 1.13 -> 0.80 ns per entry with the 16-bit indices).  Deterministic,
+ * the same at any thread count; round-off differs from the blocked transposed sweeps. */
+#define FMA_d(y, a, b) ((y) = (y) + (a) * (b))
+static inline void fma_z(double complex *y, double complex a, double complex b)
+{
+    const double ar = creal(a), ai = cimag(a), br = creal(b), bi = cimag(b);
+    double *yd = (double *)y;
+    yd[0] = yd[0] + (ar * br - ai * bi);
+    yd[1] = yd[1] + (ar * bi + ai * br);
+}
+#define FMA_z(y, a, b) fma_z(&(y), (a), (b))
+#define PLAIN_DOT4(SUF, OP, VAL, IDX, QA, QB)                                                                            \
+    {                                                                                                                    \
+        int64_t q = (QA); const int64_t qb_ = (QB);                                                                      \
+        for (; q + 4 <= qb_; q += 4) {                                                                                   \
+            FMA_##SUF(s0, OP(VAL[q]), xr[IDX[q]]); FMA_##SUF(s1, OP(VAL[q + 1]), xr[IDX[q + 1]]);                        \
+            FMA_##SUF(s2, OP(VAL[q + 2]), xr[IDX[q + 2]]); FMA_##SUF(s3, OP(VAL[q + 3]), xr[IDX[q + 3]]);                \
+        }                                                                                                                \
+        for (; q < qb_; q++) FMA_##SUF(s0, OP(VAL[q]), xr[IDX[q]]);                                                      \
+    }
+#define PLAIN_T_BODY(SUF, T, OP)                                                                                         \
+    {                                                                                                                    \
+        for (int64_t j = 0; j < n; j++) {                                                                                \
+            const int64_t qd = ud[j], q0 = Up[j], q1 = Up[j + 1]; const T d = OP(Ux[qd]);                                \
+            for (int64_t r = 0; r < nrhs; r++) {                                                                         \
+                T *xr = x + r * ldx; T s0 = 0, s1 = 0, s2 = 0, s3 = 0;                                                   \
+                PLAIN_DOT4(SUF, OP, Ux, Ui, q0, qd)                                                                      \
+                PLAIN_DOT4(SUF, OP, Ux, Ui, qd + 1, q1)                                                                  \
+                xr[j] = (xr[j] - ((s0 + s1) + (s2 + s3))) / d;                                                           \
+            }                                                                                                            \
+        }                                                                                                                \
+        for (int64_t j = n - 1; j >= 0; j--) {                                                                           \
+            const int64_t q0 = Lp[j] + 1, q1 = Lp[j + 1];                                                                \
+            for (int64_t r = 0; r < nrhs; r++) {                                                                         \
+                T *xr = x + r * ldx; T s0 = 0, s1 = 0, s2 = 0, s3 = 0;                                                   \
+                PLAIN_DOT4(SUF, OP, Lx, Li, q0, q1)                                                                      \
+                xr[j] = xr[j] - ((s0 + s1) + (s2 + s3));                                                                 \
+            }                                                                                                            \
+        }                                                                                                                \
+    }
+#define PLAIN_KERNELS(SUF, T, CJ, IT, ITN)                                                                               \
+static void plainN_##SUF##_##ITN(const fplus_solve_plan *pl, const int64_t *Lp, const IT *Li, const T *Lx,              \
+                                 const int64_t *Up, const IT *Ui, const T *Ux, T *x, int64_t nrhs, int64_t ldx)          \
+{                                                                                                                        \
+    const int64_t n = pl->n, *ud = pl->udiag;                                                                            \
+    if (nrhs == 1) {                                                                                                     \
+        for (int64_t j = 0; j < n; j++) {                                                                                \
+            const T xj = x[j];                                                                                           \
+            if (xj == 0) continue;                                                                                       \
+            const int64_t q1 = Lp[j + 1];                                                                                \
+            for (int64_t q = Lp[j] + 1; q < q1; q++) FMS_##SUF(x[Li[q]], xj, Lx[q]);                                     \
+        }                                                                                                                \
+        for (int64_t j = n - 1; j >= 0; j--) {                                                                           \
+            const int64_t qd = ud[j], q1 = Up[j + 1]; const T xj = x[j] / Ux[qd];                                        \
+            x[j] = xj;                                                                                                   \
+            if (xj == 0) continue;                                                                                       \
+            for (int64_t q = Up[j]; q < qd; q++) FMS_##SUF(x[Ui[q]], xj, Ux[q]);                                         \
+            for (int64_t q = qd + 1; q < q1; q++) FMS_##SUF(x[Ui[q]], xj, Ux[q]);                                        \
+        }                                                                                                                \
+        return;                                                                                                          \
+    }                                                                                                                    \
+    for (int64_t j = 0; j < n; j++)                                                                                      \
+        for (int64_t r = 0; r < nrhs; r++) {                                                                             \
+            T *xr = x + r * ldx; const T xj = xr[j];                                                                     \
+            if (xj == 0) continue;                                                                                       \
+            for (int64_t q = Lp[j] + 1; q < Lp[j + 1]; q++) FMS_##SUF(xr[Li[q]], xj, Lx[q]);                             \
+        }                                                                                                                \
+    for (int64_t j = n - 1; j >= 0; j--) {                                                                               \
+        const int64_t qd = ud[j]; const T d = Ux[qd];                                                                    \
+        for (int64_t r = 0; r < nrhs; r++) {                                                                             \
+            T *xr = x + r * ldx; const T xj = xr[j] / d;                                                                 \
+            xr[j] = xj;                                                                                                  \
+            if (xj == 0) continue;                                                                                       \
+            for (int64_t q = Up[j]; q < qd; q++) FMS_##SUF(xr[Ui[q]], xj, Ux[q]);                                        \
+            for (int64_t q = qd + 1; q < Up[j + 1]; q++) FMS_##SUF(xr[Ui[q]], xj, Ux[q]);                                \
+        }                                                                                                                \
+    }                                                                                                                    \
+}                                                                                                                        \
+static void plainT_##SUF##_##ITN(const fplus_solve_plan *pl, const int64_t *Lp, const IT *Li, const T *Lx,              \
+                                 const int64_t *Up, const IT *Ui, const T *Ux, T *x, int64_t nrhs, int64_t ldx, int cj)  \
+{                                                                                                                        \
+    const int64_t n = pl->n, *ud = pl->udiag;                                                                            \
+    if (cj) PLAIN_T_BODY(SUF, T, CJ) else PLAIN_T_BODY(SUF, T, )                                                         \
+}
+PLAIN_KERNELS(z, double complex, conj, uint16_t, u16)
+PLAIN_KERNELS(z, double complex, conj, int32_t, i32)
+PLAIN_KERNELS(d, double, conj_plan_d, uint16_t, u16)
+PLAIN_KERNELS(d, double, conj_plan_d, int32_t, i32)
+
 int fplus_tri_solve_plan(const fplus_solve_plan *pl, int64_t n, const int64_t *Lp, const int64_t *Li, const void *Lx,
                          const int64_t *Up, const int64_t *Ui, const void *Ux, void *x, int64_t nrhs, int64_t ldx,
                          int trans, int is_complex)
@@ -655,13 +679,12 @@ int fplus_tri_solve_plan(const fplus_solve_plan *pl, int64_t n, const int64_t *L
     }
     if (nrhs == 0 || n == 0) return FPLUS_OK;
     if (pl->plain) {
-        if (is_complex) {
-            if (trans == 0) plainN_z(pl, Lp, Li, (const double complex *)Lx, Up, Ui, (const double complex *)Ux, (double complex *)x, nrhs, ldx);
-            else plainT_z(pl, Lp, Li, (const double complex *)Lx, Up, Ui, (const double complex *)Ux, (double complex *)x, nrhs, ldx, trans == 2);
-        } else {
-            if (trans == 0) plainN_d(pl, Lp, Li, (const double *)Lx, Up, Ui, (const double *)Ux, (double *)x, nrhs, ldx);
-            else plainT_d(pl, Lp, Li, (const double *)Lx, Up, Ui, (const double *)Ux, (double *)x, nrhs, ldx, 0);
-        }
+#define PLAIN_CALL(SUF, T, ITN, IT)                                                                                      \
+        { if (trans == 0) plainN_##SUF##_##ITN(pl, Lp, (const IT *)pl->Li_c, (const T *)Lx, Up, (const IT *)pl->Ui_c, (const T *)Ux, (T *)x, nrhs, ldx); \
+          else plainT_##SUF##_##ITN(pl, Lp, (const IT *)pl->Li_c, (const T *)Lx, Up, (const IT *)pl->Ui_c, (const T *)Ux, (T *)x, nrhs, ldx, trans == 2); }
+        if (is_complex) { if (pl->idx16) PLAIN_CALL(z, double complex, u16, uint16_t) else PLAIN_CALL(z, double complex, i32, int32_t) }
+        else            { if (pl->idx16) PLAIN_CALL(d, double, u16, uint16_t) else PLAIN_CALL(d, double, i32, int32_t) }
+#undef PLAIN_CALL
         return FPLUS_OK;
     }
     void *wR = pl->maxR > 0 ? malloc((size_t)(pl->maxR * nrhs) * vs) : NULL;   /* NULL: the sweeps without the gather */
