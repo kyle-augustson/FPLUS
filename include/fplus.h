@@ -149,7 +149,7 @@ typedef struct {
     int     pivot_strategy;     /* FPLUS_PIVOT_PARTIAL (default), _ROOK or _FULL */
     double  drop_tol;           /* 0 (default): exact LU.  > 0: incomplete LU (ILUT-style threshold dropping), see below */
     int64_t relax_rows;         /* relaxed supernodes (32; < 0 automatic) */
-    int64_t panel;              /* panel width (512; < 0 from the thread count) */
+    int64_t panel;              /* panel width (512; < 0 automatic: 1 when n <= 4096 and nnz(A) <= 24 n, else from the thread count) */
     int     use_gpu;            /* cuBLAS updates (0) */
     double  gpu_min_flops;      /* (5e7) */
     int     verbose;            /* (0) */

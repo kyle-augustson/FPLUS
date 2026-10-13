@@ -636,6 +636,13 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
     W.relax_rows = relax_rows > 0 ? relax_rows : 0;
     W.relax_auto = relax_rows < 0;
     W.rz_w[0] = 4; W.rz_w[1] = 16; W.rz_w[2] = 48; W.rz_z[0] = 0.8; W.rz_z[1] = 0.1; W.rz_z[2] = 0.05; W.rz_cap = 32;
+    /* Small sparse matrices (n <= 4096, at most 24 entries per column: the radial pencils of Dedalus / Rayleigh, small FD
+       matrices): their factors stay sparse (40-160 entries per column), the work is bookkeeping rather than arithmetic, and
+       tighter bounds (2 / 8 / 32, 0.3 / 0.03 / 0.01, cap 8) and the column kernel (panel 1, below) are fastest at one thread:
+       Rayleigh SBDF3 pencils factored as A^T, 0.42-3.65 ms against 0.91-5.16 ms with the general bounds and panel 64
+       (2026-10-12).  The choice depends on n and nnz(A) only. */
+    const int small_sparse = n <= 4096 && nnzA <= 24 * n;
+    if (small_sparse) { W.rz_w[0] = 2; W.rz_w[1] = 8; W.rz_w[2] = 32; W.rz_z[0] = 0.3; W.rz_z[1] = 0.03; W.rz_z[2] = 0.01; W.rz_cap = 8; }
     { const char *e = getenv("FPLUS_RELAX_AUTO");      /* "w0,w1,w2,z0,z1,z2,cap": tuning only */
       if (e) { long a0, a1, a2, a6; double b0, b1, b2;
                if (sscanf(e, "%ld,%ld,%ld,%lf,%lf,%lf,%ld", &a0, &a1, &a2, &b0, &b1, &b2, &a6) == 7) {
@@ -671,6 +678,7 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
     /* panel < 0 (auto): the width from the thread count.  One thread: 64 (2026-10-12, 1 thread, n 1.2k-14k, real and complex:
        64-128 within 2 percent of the best width, 512 up to 1.3x slower); more threads keep more columns in flight: base x threads/2,
        at most cap (512 at 16 threads: the 48 x 144 production setting of FINDINGS 63.126).  FPLUS_PANEL_AUTO="base,cap": tuning. */
+    if (panel < 0 && small_sparse) panel = 1;
     if (panel < 0) {
         int nt = 1;
 #ifdef _OPENMP

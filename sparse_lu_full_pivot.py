@@ -288,7 +288,9 @@ def sparse_lu_full_pivot(
         joins while the share of explicit zeros in the grown supernode
         stays below a bound that tightens with its width (any up to width
         4, 0.8 up to 16, 0.1 up to 48, 0.05 beyond; CHOLMOD's amalgamation
-        defaults) and the mismatch is at most 32 rows.  A fixed count suits
+        defaults) and the mismatch is at most 32 rows; for small sparse
+        matrices (n <= 4096, nnz(A) <= 24 n) the tighter bounds 2 / 8 / 32,
+        0.3 / 0.03 / 0.01, at most 8 rows.  A fixed count suits
         one kind of matrix only (2 on very sparse radial pencils, 32 on
         dense-row meridional ones); the automatic rule was within a few
         percent of the better fixed value on both, and faster than both on
@@ -330,10 +332,11 @@ def sparse_lu_full_pivot(
         reaches at once (trsm + gemm), the within-panel updates per
         column.  Default 1 = one column at a time.  Same pivots as
         panel=1 (up to ties); 32 gave 3.2x at n = 100k with relax_rows=2.
-        A negative value picks the width from the OpenMP thread count:
-        64 x max(1, threads / 2), at most 512 (64 was within 2 percent of
-        the best width at one thread for n 1.2k-14k; 512 is the 16-thread
-        48 x 144 production setting).
+        A negative value picks the width: 1 for small sparse matrices
+        (n <= 4096 and nnz(A) <= 24 n, e.g. the radial pencils of
+        Dedalus / Rayleigh, whose factors stay sparse), otherwise from the
+        OpenMP thread count, 64 x max(1, threads / 2), at most 512 (512 is
+        the 16-thread 48 x 144 production setting).
 
     Returns
     -------
