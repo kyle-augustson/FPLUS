@@ -57,6 +57,10 @@ extern void cblas_ztrsv(int order, int uplo, int trans, int diag, int N,
 extern void cblas_dgemv(int order, int trans, int M, int N, double alpha,
                         const double *A, int lda, const double *X, int incX,
                         double beta, double *Y, int incY);
+extern void cblas_dtrsm(int order, int side, int uplo, int transa, int diag, int M, int N,
+                        double alpha, const double *A, int lda, double *B, int ldb);
+extern void cblas_dgemm(int order, int transa, int transb, int M, int N, int K, double alpha,
+                        const double *A, int lda, const double *B, int ldb, double beta, double *C, int ldc);
 extern void cblas_ztrsm(int order, int side, int uplo, int transa, int diag, int M, int N,
                         const void *alpha, const void *A, int lda, void *B, int ldb);
 extern void cblas_zgemm(int order, int transa, int transb, int M, int N, int K, const void *alpha,

@@ -130,6 +130,16 @@ _PY_PIPELINE = _os.environ.get("FPLUS_PY_ORDERING") == "1"
 _RUIZ_TOL      = 1e-2
 
 
+def _ruiz_iters(equilibrate):
+    """equilibrate -> the number of Ruiz iterations: True = _RUIZ_MAX_ITER (to tolerance), False / 0 = none, an int k = at most k."""
+    if equilibrate is None or isinstance(equilibrate, (bool, np.bool_)):
+        return _RUIZ_MAX_ITER if equilibrate else 0
+    k = int(equilibrate)
+    if k < 0 or k != equilibrate:
+        raise ValueError(f"equilibrate must be a bool or a non-negative int; got {equilibrate!r}")
+    return k
+
+
 # ===========================================================================
 # Public API
 # ===========================================================================
@@ -179,9 +189,13 @@ def sparse_lu_full_pivot(
         at or below ``drop_tol``), the pivot is replaced by
         ``drop_tol * max|a_ij|`` as in SuperLU's ILU, with a RuntimeWarning.
 
-    equilibrate : bool, optional
+    equilibrate : bool or int, optional
         Apply Ruiz iterative L-inf equilibration before factorisation.
-        Default True.  Disable only if A is already well-scaled.
+        Default True (iterations to tolerance, at most 20).  An int k runs
+        at most k iterations (0 = none).  Partial pivoting on the scaled
+        matrix picks different rows: on spectral pencils with tau rows the
+        fully converged scaling raised nnz(L+U) by 8-117 percent against
+        none or one iteration (2026-10-12), at equal backward error.
 
     colamd : bool, optional
         Apply COLAMD fill-reducing column ordering before factorisation.
@@ -270,7 +284,15 @@ def sparse_lu_full_pivot(
         (relaxed supernodes).  Default 0 = exact supernodes.  On complex
         spectral-MHD test pencils 2 merges ~93 percent of the near-misses
         (mean supernode width 1.9 -> 26 at n = 100k) for ~6 percent more
-        fill.
+        fill.  A negative value selects the automatic rule: a column
+        joins while the share of explicit zeros in the grown supernode
+        stays below a bound that tightens with its width (any up to width
+        4, 0.8 up to 16, 0.1 up to 48, 0.05 beyond; CHOLMOD's amalgamation
+        defaults) and the mismatch is at most 32 rows.  A fixed count suits
+        one kind of matrix only (2 on very sparse radial pencils, 32 on
+        dense-row meridional ones); the automatic rule was within a few
+        percent of the better fixed value on both, and faster than both on
+        some (2026-10-12).
 
     gpu : bool, optional
         panel > 1, complex, BLAS build: run the zgemm of each panel update
@@ -302,12 +324,16 @@ def sparse_lu_full_pivot(
         clear_ordering_cache() empties it.
 
     panel : int, optional
-        Supernodal partial pivoting, complex matrices, BLAS build only.
+        Supernodal partial pivoting, BLAS build only (real and complex).
         Columns are processed in panels of this width: each supernode
         complete before the panel is applied to every panel column it
-        reaches at once (ztrsm + zgemm), the within-panel updates per
+        reaches at once (trsm + gemm), the within-panel updates per
         column.  Default 1 = one column at a time.  Same pivots as
-        panel=1; 32 gave 3.2x at n = 100k with relax_rows=2.
+        panel=1 (up to ties); 32 gave 3.2x at n = 100k with relax_rows=2.
+        A negative value picks the width from the OpenMP thread count:
+        64 x max(1, threads / 2), at most 512 (64 was within 2 percent of
+        the best width at one thread for n 1.2k-14k; 512 is the 16-thread
+        48 x 144 production setting).
 
     Returns
     -------
@@ -1118,14 +1144,14 @@ def _colamd_splu_fallback(A_struct: csr_matrix, n: int) -> np.ndarray:
 # C-extension factorisation path
 # ===========================================================================
 
-def _ruiz_c(A, n, is_complex, target_dtype, verbose=0):
+def _ruiz_c(A, n, is_complex, target_dtype, verbose=0, max_iter=None):
     """Ruiz on CSR or CSC arrays (the C routine's CSC variant gives the same Dr, Dc and scaled entries bit for bit)."""
     indices = A.indices.astype(np.int64, copy=False)
     indptr  = A.indptr.astype(np.int64, copy=False)
     data    = np.ascontiguousarray(A.data, dtype=target_dtype)
     raw = _sparse_lu_c.ruiz_equilibrate(
         data, indices, indptr,
-        n, _RUIZ_MAX_ITER, _RUIZ_TOL, int(is_complex), int(verbose), int(isinstance(A, csc_matrix))
+        n, _RUIZ_MAX_ITER if max_iter is None else int(max_iter), _RUIZ_TOL, int(is_complex), int(verbose), int(isinstance(A, csc_matrix))
     )
     return raw["Dr"], raw["Dc"], raw["data"]
 
@@ -1141,7 +1167,7 @@ def _lu_factor_c_perm(A_csc, row_perm, col_perm, n, equilibrate, is_complex, ver
     raw = _sparse_lu_c.factor_sn_perm(
         data, A_c.indices.astype(np.int64, copy=False), A_c.indptr.astype(np.int64, copy=False), n,
         np.ascontiguousarray(row_perm, dtype=np.int64), np.ascontiguousarray(col_perm, dtype=np.int64), int(is_complex),
-        int(bool(equilibrate)), _RUIZ_MAX_ITER, _RUIZ_TOL, int(verbose), int(relax_rows), int(panel), int(bool(gpu)),
+        int(_ruiz_iters(equilibrate) > 0), max(_ruiz_iters(equilibrate), 1), _RUIZ_TOL, int(verbose), int(relax_rows), int(panel), int(bool(gpu)),
         float(gpu_min_flops), pivot_rel)
     fmt = csc_matrix if return_csc else (lambda *a, **k: csc_matrix(*a, **k).tocsr())   # noqa: E731
     L = fmt((raw["L_data"], raw["L_indices"], raw["L_indptr"]), shape=(n, n), dtype=target_dtype)
@@ -1161,8 +1187,8 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
     indices = A_csc.indices.astype(np.int64, copy=False)
     indptr  = A_csc.indptr.astype(np.int64, copy=False)
 
-    if equilibrate:
-        Dr, Dc, data = _ruiz_c(A_csc, n, is_complex, target_dtype, verbose)
+    if _ruiz_iters(equilibrate) > 0:
+        Dr, Dc, data = _ruiz_c(A_csc, n, is_complex, target_dtype, verbose, _ruiz_iters(equilibrate))
     else:
         Dr   = np.ones(n, dtype=np.float64)
         Dc   = np.ones(n, dtype=np.float64)
@@ -1208,7 +1234,7 @@ def _lu_factor_c(A, n, drop_tol, equilibrate, is_complex, dtype,
 # Pure-Python fallback factorisation
 # ===========================================================================
 
-def _ruiz_py(A_csr, n, target_dtype):
+def _ruiz_py(A_csr, n, target_dtype, max_iter=None):
     """Pure-Python Ruiz equilibration using vectorised numpy."""
     indptr  = np.asarray(A_csr.indptr,  dtype=np.int64)
     indices = np.asarray(A_csr.indices, dtype=np.int64)
@@ -1220,7 +1246,7 @@ def _ruiz_py(A_csr, n, target_dtype):
     row_idx = np.repeat(np.arange(n, dtype=np.int64), np.diff(indptr))
     nz_rows = np.diff(indptr) > 0
 
-    for _ in range(_RUIZ_MAX_ITER):
+    for _ in range(_RUIZ_MAX_ITER if max_iter is None else max_iter):
         abs_data = np.abs(data)
 
         row_max = np.zeros(n, dtype=np.float64)
@@ -1277,8 +1303,8 @@ def _lu_factor_py(A, n, drop_tol, equilibrate, dtype):
     A_csr = A.astype(target_dtype).tocsr()
     A_csr.sort_indices()
 
-    if equilibrate:
-        Dr, Dc, eq_data = _ruiz_py(A_csr, n, target_dtype)
+    if _ruiz_iters(equilibrate) > 0:
+        Dr, Dc, eq_data = _ruiz_py(A_csr, n, target_dtype, _ruiz_iters(equilibrate))
         A_work = csr_matrix(
             (eq_data, A_csr.indices.copy(), A_csr.indptr.copy()),
             shape=(n, n)

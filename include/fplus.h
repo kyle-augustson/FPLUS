@@ -48,8 +48,9 @@ typedef struct {
 void fplus_factors_free(fplus_factors *f);
 
 /* Supernodal left-looking LU with partial pivoting of the CSC matrix (Ap, Ai, Ax).  relax_rows: relaxed supernode joins
- * (rows of pattern mismatch allowed); panel: columns per panel (complex only; > 1 batches the updates); use_gpu: cuBLAS
- * zgemm for updates above gpu_min_flops (dlopen; complex, panel > 1). */
+ * (rows of pattern mismatch allowed; < 0: automatic, by the share of explicit zeros, CHOLMOD-style); panel: columns per panel
+ * (> 1 batches the updates, real and complex; < 0: from the thread count); use_gpu: cuBLAS zgemm for updates above
+ * gpu_min_flops (dlopen; complex, panel > 1). */
 int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void *Ax, int is_complex, int verbose,
                     int64_t relax_rows, int64_t panel, int use_gpu, double gpu_min_flops, double pivot_rel,
                     fplus_factors *out, char *err, size_t errlen);
@@ -147,8 +148,8 @@ typedef struct {
     double  pivot_rel;          /* singular when the best pivot < pivot_rel * the column's max (FPLUS_PIVOT_REL_DEFAULT; 0: exact zeros only) */
     int     pivot_strategy;     /* FPLUS_PIVOT_PARTIAL (default), _ROOK or _FULL */
     double  drop_tol;           /* 0 (default): exact LU.  > 0: incomplete LU (ILUT-style threshold dropping), see below */
-    int64_t relax_rows;         /* relaxed supernodes (32) */
-    int64_t panel;              /* panel width (512) */
+    int64_t relax_rows;         /* relaxed supernodes (32; < 0 automatic) */
+    int64_t panel;              /* panel width (512; < 0 from the thread count) */
     int     use_gpu;            /* cuBLAS updates (0) */
     double  gpu_min_flops;      /* (5e7) */
     int     verbose;            /* (0) */
