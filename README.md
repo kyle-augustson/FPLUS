@@ -218,6 +218,14 @@ numerical guarantee and can afford the dramatic fill-in cost. Full pivoting's
 column swaps destroy the COLAMD ordering and can produce factors orders of
 magnitude denser than partial pivoting on banded matrices.
 
+## Threads and the Cray OpenMP runtime
+
+A `SparseLU` may be built and solved from several Python threads at once (the C core releases the GIL; the ordering cache
+is locked).  Not with Cray's OpenMP runtime (CCE, e.g. `libsci_cray_mp` preloaded on HPE Cray systems): it aborts the
+process on any OpenMP call from a thread it did not create ("omp_get_max_threads attempted from non-OpenMP thread"), so
+there call FPLUS from one thread per process (MPI ranks are fine); `test_cache_concurrent_threads` fails there for this
+reason.
+
 ## Testing
 
 ```bash
