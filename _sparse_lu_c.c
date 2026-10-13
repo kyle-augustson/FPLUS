@@ -544,7 +544,97 @@ done:
     return result;
 }
 
+/* lu_solve_perm: SparseLU.solve in one call -- gather b through the row (trans 0) or column permutation with its scaling, the
+ * plan's sweeps, scatter through the other permutation with the other scaling; the operations of the Python wrapper, in the
+ * same order (x = Dc[q] * z scattered to q; transposed: rhs = Dc[q] * b[q], x[p] = Dr[p] * w), without its temporaries.
+ * Dr / Dc None: no scaling (equilibrate off).  b: (n,) or (n, k) of the factors' dtype; returns a new array of b's shape. */
+static PyObject *
+py_lu_solve_perm(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *cap, *Lp_o, *Li_o, *Lx_o, *Up_o, *Ui_o, *Ux_o, *b_o, *p_o, *q_o, *Dr_o, *Dc_o;
+    int trans, is_complex;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOiiOOOO", &cap, &Lp_o, &Li_o, &Lx_o, &Up_o, &Ui_o, &Ux_o, &b_o, &trans, &is_complex,
+                          &p_o, &q_o, &Dr_o, &Dc_o))
+        return NULL;
+    const fplus_solve_plan *pl = (const fplus_solve_plan *)PyCapsule_GetPointer(cap, "fplus_solve_plan");
+    if (!pl) return NULL;
+    const int vt = is_complex ? NPY_COMPLEX128 : NPY_FLOAT64;
+    PyArrayObject *Lp = NULL, *Li = NULL, *Lx = NULL, *Up = NULL, *Ui = NULL, *Ux = NULL, *bin = NULL, *pa = NULL, *qa = NULL;
+    PyArrayObject *Dra = NULL, *Dca = NULL, *out = NULL;
+    PyObject *result = NULL;
+    void *w = NULL;
+    if (!(Lp = as_1d(Lp_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Lp")) || !(Li = as_1d(Li_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Li"))
+            || !(Lx = as_1d(Lx_o, vt, NPY_ARRAY_IN_ARRAY, "Lx")) || !(Up = as_1d(Up_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Up"))
+            || !(Ui = as_1d(Ui_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "Ui")) || !(Ux = as_1d(Ux_o, vt, NPY_ARRAY_IN_ARRAY, "Ux"))
+            || !(pa = as_1d(p_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "p")) || !(qa = as_1d(q_o, NPY_INT64, NPY_ARRAY_IN_ARRAY, "q"))
+            || (Dr_o != Py_None && !(Dra = as_1d(Dr_o, NPY_FLOAT64, NPY_ARRAY_IN_ARRAY, "Dr")))
+            || (Dc_o != Py_None && !(Dca = as_1d(Dc_o, NPY_FLOAT64, NPY_ARRAY_IN_ARRAY, "Dc"))))
+        goto done;
+    if (!(bin = (PyArrayObject *)PyArray_FROM_OTF(b_o, vt, NPY_ARRAY_IN_ARRAY))) goto done;
+    if (trans < 0 || trans > 2) { PyErr_SetString(PyExc_ValueError, "lu_solve_perm: trans must be 0, 1 or 2"); goto done; }
+    {
+        const int64_t n = PyArray_DIM(Lp, 0) - 1;
+        if (n < 0 || PyArray_DIM(Up, 0) != n + 1 || check_compressed_lengths(n, Lp, Li, Lx, "lu_solve_perm (L)")
+                || check_compressed_lengths(n, Up, Ui, Ux, "lu_solve_perm (U)")) {
+            if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "lu_solve_perm: Lp and Up must both have length n + 1");
+            goto done;
+        }
+        const int nd = PyArray_NDIM(bin);
+        if ((nd != 1 && nd != 2) || PyArray_DIM(bin, 0) != n || PyArray_DIM(pa, 0) != n || PyArray_DIM(qa, 0) != n
+                || (Dra && PyArray_DIM(Dra, 0) != n) || (Dca && PyArray_DIM(Dca, 0) != n)) {
+            PyErr_SetString(PyExc_ValueError, "lu_solve_perm: b must have shape (n,) or (n, nrhs); p, q, Dr, Dc length n");
+            goto done;
+        }
+        const int64_t k = nd == 2 ? PyArray_DIM(bin, 1) : 1;
+        const int64_t *P = (const int64_t *)PyArray_DATA(pa), *Q = (const int64_t *)PyArray_DATA(qa);
+        for (int64_t i = 0; i < n; i++)
+            if (P[i] < 0 || P[i] >= n || Q[i] < 0 || Q[i] >= n) { PyErr_SetString(PyExc_ValueError, "lu_solve_perm: p or q out of range"); goto done; }
+        if (!(out = (PyArrayObject *)PyArray_NewLikeArray(bin, NPY_CORDER, NULL, 0))) goto done;
+        const size_t vs = is_complex ? sizeof(double complex) : sizeof(double);
+        if (!(w = malloc((size_t)(n > 0 ? n : 1) * (size_t)(k > 0 ? k : 1) * vs))) { PyErr_NoMemory(); goto done; }
+        /* in: through G with scaling Dg (trans 0: p, Dr; else q, Dc); out: through S with Ds (trans 0: q, Dc; else p, Dr) */
+        const int64_t *G = trans == 0 ? P : Q, *Sc = trans == 0 ? Q : P;
+        const double *Dg = trans == 0 ? (Dra ? (const double *)PyArray_DATA(Dra) : NULL) : (Dca ? (const double *)PyArray_DATA(Dca) : NULL);
+        const double *Ds = trans == 0 ? (Dca ? (const double *)PyArray_DATA(Dca) : NULL) : (Dra ? (const double *)PyArray_DATA(Dra) : NULL);
+        int rc;
+        Py_BEGIN_ALLOW_THREADS
+        if (is_complex) {
+            const double complex *bb = (const double complex *)PyArray_DATA(bin); double complex *ww = (double complex *)w, *xx = (double complex *)PyArray_DATA(out);
+            for (int64_t r = 0; r < k; r++)
+                for (int64_t i = 0; i < n; i++) ww[r * n + i] = Dg ? Dg[G[i]] * bb[G[i] * k + r] : bb[G[i] * k + r];
+            rc = fplus_tri_solve_plan(pl, n, (const int64_t *)PyArray_DATA(Lp), (const int64_t *)PyArray_DATA(Li), PyArray_DATA(Lx),
+                                      (const int64_t *)PyArray_DATA(Up), (const int64_t *)PyArray_DATA(Ui), PyArray_DATA(Ux), w, k, n, trans, 1);
+            if (rc == FPLUS_OK)
+                for (int64_t r = 0; r < k; r++)
+                    for (int64_t i = 0; i < n; i++) xx[Sc[i] * k + r] = Ds ? Ds[Sc[i]] * ww[r * n + i] : ww[r * n + i];
+        } else {
+            const double *bb = (const double *)PyArray_DATA(bin); double *ww = (double *)w, *xx = (double *)PyArray_DATA(out);
+            for (int64_t r = 0; r < k; r++)
+                for (int64_t i = 0; i < n; i++) ww[r * n + i] = Dg ? Dg[G[i]] * bb[G[i] * k + r] : bb[G[i] * k + r];
+            rc = fplus_tri_solve_plan(pl, n, (const int64_t *)PyArray_DATA(Lp), (const int64_t *)PyArray_DATA(Li), PyArray_DATA(Lx),
+                                      (const int64_t *)PyArray_DATA(Up), (const int64_t *)PyArray_DATA(Ui), PyArray_DATA(Ux), w, k, n, trans, 0);
+            if (rc == FPLUS_OK)
+                for (int64_t r = 0; r < k; r++)
+                    for (int64_t i = 0; i < n; i++) xx[Sc[i] * k + r] = Ds ? Ds[Sc[i]] * ww[r * n + i] : ww[r * n + i];
+        }
+        Py_END_ALLOW_THREADS
+        if (rc == FPLUS_ERR_SINGULAR) { PyErr_SetString(PyExc_RuntimeError, "lu_solve_perm: zero or missing diagonal in U"); goto done; }
+        if (rc == FPLUS_ERR_BADARG) { PyErr_SetString(PyExc_ValueError, "lu_solve_perm: the plan does not match these factors"); goto done; }
+        if (rc != FPLUS_OK) { raise_fplus(rc, "lu_solve_perm failed"); goto done; }
+        result = (PyObject *)out; out = NULL;
+    }
+done:
+    free(w);
+    Py_XDECREF(Lp); Py_XDECREF(Li); Py_XDECREF(Lx); Py_XDECREF(Up); Py_XDECREF(Ui); Py_XDECREF(Ux);
+    Py_XDECREF(bin); Py_XDECREF(pa); Py_XDECREF(qa); Py_XDECREF(Dra); Py_XDECREF(Dca); Py_XDECREF(out);
+    return result;
+}
+
 static PyMethodDef SparseLUMethods[] = {
+    {"lu_solve_perm", py_lu_solve_perm, METH_VARARGS,
+     "lu_solve_perm(plan, Lp, Li, Lx, Up, Ui, Ux, b, trans, is_complex, p, q, Dr, Dc) -> x\n"
+     "SparseLU.solve in one call: permutations and scalings (Dr / Dc None: none) around the plan's sweeps.\n"},
     {"analyze", py_analyze, METH_VARARGS,
      "analyze(indptr, indices, n[, pin_dense, tau_density, tau_min_nnz, row_mask, col_mask, postorder]) -> dict\n"
      "Static orders of a canonical CSC pattern: row_perm, col_perm (A[row_perm][:, col_perm] is factored), n_dense_rows, n_dense_cols.\n"},

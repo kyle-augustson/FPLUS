@@ -12,6 +12,12 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
     T *y = (T *)W->y;
     int64_t open = -1;
     int rc = -1;
+    /* OpenMP regions only with more than one thread: an inactive region (if clause false) still costs a runtime call per
+       supernode update and per L column, ~a third of the factor time on small matrices at one thread (2026-10-12) */
+    int par = 0;
+#ifdef _OPENMP
+    par = omp_get_max_threads() > 1;
+#endif
     T *X = (T *)calloc((size_t)P * (size_t)n, sizeof(T));
     double *colmax = (double *)malloc((size_t)P * sizeof(double));
     int64_t *ext_off = (int64_t *)malloc((size_t)(P + 1) * sizeof(int64_t));
@@ -97,13 +103,20 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
                 if (capXS < m * pc) { free(XS); capXS = 2 * m * pc; XS = (T *)malloc((size_t)capXS * sizeof(T)); if (!XS) goto out; }
                 if (capYB < nrest * pc) { free(YB); capYB = 2 * nrest * pc + 1; YB = (T *)malloc((size_t)capYB * sizeof(T)); if (!YB) goto out; }
                 /* gather and scatter: each panel column has its own accumulator column, so the columns are independent */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (pc > 1 && pc * m >= SN_PAR_MIN)
-#endif
-                for (int64_t q = c0; q < c1; q++) {
-                    const T *x = X + (size_t)ucol.a[q] * n; T *xs = XS + (q - c0) * m;
-                    for (int64_t cc = 0; cc < m; cc++) xs[cc] = x[rows[kfa + cc]];
+#define PANEL_GATHER_LOOP                                                                                        \
+                for (int64_t q = c0; q < c1; q++) {                                                                      \
+                    const T *x = X + (size_t)ucol.a[q] * n; T *xs = XS + (q - c0) * m;                                   \
+                    for (int64_t cc = 0; cc < m; cc++) xs[cc] = x[rows[kfa + cc]];                                       \
                 }
+                if (par && pc > 1 && pc * m >= SN_PAR_MIN) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                    PANEL_GATHER_LOOP
+                } else {
+                    PANEL_GATHER_LOOP
+                }
+#undef PANEL_GATHER_LOOP
                 PANEL_TRSM(102, 141, 122, 111, 132, (int)m, (int)pc, &ONE, B + kfa * ld + kfa, (int)ld, XS, (int)m);
                 if (nrest > 0) {
                     const double gfl = PANEL_FLOPF * (double)nrest * (double)pc * (double)m;
@@ -120,14 +133,21 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
                     } else
                         PANEL_GEMM(102, 111, 111, (int)nrest, (int)pc, (int)m, &ONE, B + kfa * ld + we, (int)ld, XS, (int)m, &ZERO, YB, (int)nrest);
                 }
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (pc > 1 && pc * (m + nrest) >= SN_PAR_MIN)
-#endif
-                for (int64_t q = c0; q < c1; q++) {
-                    T *x = X + (size_t)ucol.a[q] * n; const T *xs = XS + (q - c0) * m, *yb = YB + (q - c0) * nrest;
-                    for (int64_t cc = 0; cc < m; cc++) x[rows[kfa + cc]] = xs[cc];
-                    for (int64_t r = 0; r < nrest; r++) x[rows[we + r]] -= yb[r];
+#define PANEL_SCATTER_LOOP                                                                                       \
+                for (int64_t q = c0; q < c1; q++) {                                                                      \
+                    T *x = X + (size_t)ucol.a[q] * n; const T *xs = XS + (q - c0) * m, *yb = YB + (q - c0) * nrest;      \
+                    for (int64_t cc = 0; cc < m; cc++) x[rows[kfa + cc]] = xs[cc];                                       \
+                    for (int64_t r = 0; r < nrest; r++) x[rows[we + r]] -= yb[r];                                        \
                 }
+                if (par && pc > 1 && pc * (m + nrest) >= SN_PAR_MIN) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                    PANEL_SCATTER_LOOP
+                } else {
+                    PANEL_SCATTER_LOOP
+                }
+#undef PANEL_SCATTER_LOOP
 #ifdef FPLUS_PROFILE
                 SNP.fl_blas += PANEL_FLOPF * pc * ((double)m * (m - 1) / 2 + (double)m * nrest); SNP.n_upd_blas++; SNP.n_upd++;
                 SNP.fl_w[ilog2_i64(S->ncols)] += PANEL_FLOPF * pc * ((double)m * (m - 1) / 2 + (double)m * nrest);
@@ -218,6 +238,9 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
                 rc = -2; goto out;
             }
             T piv = x[pivrow];
+#ifdef FPLUS_PROFILE
+            double _t3 = wall_time(); SNP.t[4] += _t3 - _t2;
+#endif
             /* U[:, j]: the pre-panel segments (ending at the panel-start width), the within-panel segments, the diagonal */
             {
                 int64_t need = 1;
@@ -242,6 +265,9 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
                 Ui[u] = j; Ux[u] = piv; u++;
                 W->nnzU = u; W->Up[j + 1] = u;
             }
+#ifdef FPLUS_PROFILE
+            double _t4 = wall_time(); SNP.t[5] += _t4 - _t3;
+#endif
             /* the non-pivotal rows only, for the L logic */
             int64_t n_nonpiv_l = 0;
             for (int64_t q = 0; q < n_all; q++) { int64_t i = W->nonpiv[q]; if (pinv[i] < 0) W->miss[n_nonpiv_l++] = i; }
@@ -283,10 +309,14 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
                 for (int64_t rr = 0; rr < w; rr++) Bc[rr] = x[S->rows[rr]];
                 Bc[w] = 1;
                 /* the L column: one division per row, independent rows */
+                if (par && r1 - w - 1 >= SN_PAR_MIN) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (r1 - w - 1 >= SN_PAR_MIN)
+#pragma omp parallel for schedule(static)
 #endif
-                for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;
+                    for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;
+                } else {
+                    for (int64_t rr = w + 1; rr < r1; rr++) Bc[rr] = x[S->rows[rr]] / piv;
+                }
                 S->ncols = w + 1;
                 col_sn[j] = open;
             } else {
@@ -318,6 +348,9 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
             }
             free(npl);
             pinv[pivrow] = j; p[j] = pivrow;
+#ifdef FPLUS_PROFILE
+            double _t5 = wall_time(); SNP.t[6] += _t5 - _t4;
+#endif
             /* clear the accumulator: every pattern row and every segment row */
             for (int64_t q = 0; q < n_all; q++) x[W->nonpiv[q]] = 0;
             for (int64_t q = ext_off[ci]; q < ext_off[ci + 1]; q++) {
@@ -352,7 +385,7 @@ static int PANEL_NAME(SnWork *W, const int64_t *Ap, const int64_t *Ai, const PAN
                 }
             }
 #ifdef FPLUS_PROFILE
-            SNP.t[4] += wall_time() - _t2;
+            SNP.t[7] += wall_time() - _t5;
 #endif
         }
         if (verbose >= 2 && ((j0 / P) % (n / (20 * P) + 1) == 0))

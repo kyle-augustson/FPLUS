@@ -24,6 +24,10 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(FPLUS_C_FLAGS -O3 -fno-math-errno -fno-signed-zeros -DNDEBUG)
 if(FPLUS_MARCH)
   list(APPEND FPLUS_C_FLAGS -march=${FPLUS_MARCH})
+  # an -mtune in CFLAGS (conda's compilers set -mtune=haswell) overrides the tuning -march=native implies: tune for this CPU too
+  if(FPLUS_MARCH STREQUAL "native")
+    list(APPEND FPLUS_C_FLAGS -mtune=native)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------- dependencies

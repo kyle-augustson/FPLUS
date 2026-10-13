@@ -677,6 +677,11 @@ class SparseLU:
         self._Dr = Dr
         self._Dc = Dc
         self._n  = A_sp.shape[0]
+        # the one-call solve (C: permutations, scalings and sweeps); unit scalings (equilibrate off) are skipped there
+        self._perm_solve = self._plan is not None and hasattr(_sparse_lu_c, "lu_solve_perm")
+        self._Dr_c = None if Dr is None or np.all(Dr == 1.0) else np.ascontiguousarray(Dr, dtype=np.float64)
+        self._Dc_c = None if Dc is None or np.all(Dc == 1.0) else np.ascontiguousarray(Dc, dtype=np.float64)
+        self._is_complex = bool(np.iscomplexobj(self._L.data))
 
     @property
     def L(self):
@@ -725,6 +730,12 @@ class SparseLU:
         x : ndarray, same shape as b
         """
         b = np.asarray(b)
+        if self._perm_solve and b.ndim in (1, 2) and (self._is_complex or not np.iscomplexobj(b)) and trans in ('N', 'T', 'H'):
+            # one C call; the same operations, in the same order, as _solve_single / _solve_transposed below
+            tr = 0 if trans == 'N' else (1 if trans == 'T' or not self._is_complex else 2)
+            (Lp, Li, Lx), (Up, Ui, Ux) = self._L_arrays, self._U_arrays
+            return _sparse_lu_c.lu_solve_perm(self._plan, Lp, Li, Lx, Up, Ui, Ux, b, tr, int(self._is_complex),
+                                              self._p, self._q, self._Dr_c, self._Dc_c)
         if b.ndim == 1 or (b.ndim == 2 and self._plan is not None):
             return self._solve_single(b, trans)     # with a plan, all columns of b in one blocked solve
         else:

@@ -54,7 +54,9 @@ if sys.platform == "win32":
         else:
             libraries.append("openblas")
 else:
-    extra_compile_args = ["-O3", "-march=native",
+    # -mtune=native as well: an -mtune in the environment's CFLAGS (conda's compilers set -mtune=haswell) overrides the tuning
+    # -march=native implies, and the Haswell tuning made the transposed solves 2x slower on a Cascade Lake Xeon (2026-10-12)
+    extra_compile_args = ["-O3", "-march=native", "-mtune=native",
                           "-fno-math-errno", "-fno-signed-zeros",
                           "-DNDEBUG", "-std=c99"]
     extra_link_args    = []
