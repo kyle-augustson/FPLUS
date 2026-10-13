@@ -451,8 +451,8 @@ py_analyze(PyObject *self, PyObject *args)
 {
     (void)self;
     PyObject *ptr_o, *idx_o, *rmask_o = Py_None, *cmask_o = Py_None;
-    Py_ssize_t n_s; int pin_dense = 1, postorder = 1; double tau_density = 0.5; long long tau_min_nnz = 10;
-    if (!PyArg_ParseTuple(args, "OOn|idLOOi", &ptr_o, &idx_o, &n_s, &pin_dense, &tau_density, &tau_min_nnz, &rmask_o, &cmask_o, &postorder))
+    Py_ssize_t n_s; int pin_dense = 1, postorder = 1, ordering = FPLUS_ORDER_COLAMD; double tau_density = 0.5; long long tau_min_nnz = 10;
+    if (!PyArg_ParseTuple(args, "OOn|idLOOii", &ptr_o, &idx_o, &n_s, &pin_dense, &tau_density, &tau_min_nnz, &rmask_o, &cmask_o, &postorder, &ordering))
         return NULL;
     int64_t n = (int64_t)n_s;
     PyArrayObject *ptr_a = NULL, *idx_a = NULL, *rm_a = NULL, *cm_a = NULL;
@@ -469,9 +469,9 @@ py_analyze(PyObject *self, PyObject *args)
     {
         fplus_symbolic *sym = NULL; char err[512] = {0}; int rc;
         Py_BEGIN_ALLOW_THREADS
-        rc = fplus_analyze(n, (const int64_t *)PyArray_DATA(ptr_a), (const int64_t *)PyArray_DATA(idx_a), pin_dense, tau_density,
-                           (int64_t)tau_min_nnz, rm_a ? (const unsigned char *)PyArray_DATA(rm_a) : NULL,
-                           cm_a ? (const unsigned char *)PyArray_DATA(cm_a) : NULL, postorder, &sym, err, sizeof(err));
+        rc = fplus_analyze_ord(n, (const int64_t *)PyArray_DATA(ptr_a), (const int64_t *)PyArray_DATA(idx_a), pin_dense, tau_density,
+                               (int64_t)tau_min_nnz, rm_a ? (const unsigned char *)PyArray_DATA(rm_a) : NULL,
+                               cm_a ? (const unsigned char *)PyArray_DATA(cm_a) : NULL, postorder, ordering, &sym, err, sizeof(err));
         Py_END_ALLOW_THREADS
         if (rc != FPLUS_OK) { raise_fplus(rc, err); goto done; }
         npy_intp dn = (npy_intp)n;
@@ -636,7 +636,7 @@ static PyMethodDef SparseLUMethods[] = {
      "lu_solve_perm(plan, Lp, Li, Lx, Up, Ui, Ux, b, trans, is_complex, p, q, Dr, Dc) -> x\n"
      "SparseLU.solve in one call: permutations and scalings (Dr / Dc None: none) around the plan's sweeps.\n"},
     {"analyze", py_analyze, METH_VARARGS,
-     "analyze(indptr, indices, n[, pin_dense, tau_density, tau_min_nnz, row_mask, col_mask, postorder]) -> dict\n"
+     "analyze(indptr, indices, n[, pin_dense, tau_density, tau_min_nnz, row_mask, col_mask, postorder, ordering]) -> dict\n"
      "Static orders of a canonical CSC pattern: row_perm, col_perm (A[row_perm][:, col_perm] is factored), n_dense_rows, n_dense_cols.\n"},
     {"factor_sn_perm", py_factor_sn_perm, METH_VARARGS,
      "factor_sn_perm(data, indices, indptr, n, row_perm, col_perm, is_complex[, equilibrate, ruiz_max_iter, ruiz_tol, verbose,\n"
@@ -709,6 +709,6 @@ PyInit__sparse_lu_c(void)
     import_array();
     PyObject *m = PyModule_Create(&moduledef);
     /* the Python layer requires this version, so a stale build cannot silently stand in for the current one (audit 2026-10-10) */
-    if (m && PyModule_AddIntConstant(m, "API_VERSION", 4) != 0) { Py_DECREF(m); return NULL; }
+    if (m && PyModule_AddIntConstant(m, "API_VERSION", 5) != 0) { Py_DECREF(m); return NULL; }
     return m;
 }

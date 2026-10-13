@@ -25,7 +25,7 @@ Requirements
     A C99-capable compiler (gcc >= 7, clang >= 5, MSVC 2019+)
     OpenMP  (optional; gcc -fopenmp, clang -fopenmp, MSVC /openmp)
     BLAS    (optional; libblas, OpenBLAS, MKL, etc., providing CBLAS interface)
-    SuiteSparse COLAMD (required: colamd.h and libcolamd; SUITESPARSE_INCLUDE_DIR / SUITESPARSE_LIB_DIR)
+    SuiteSparse COLAMD and AMD (required: colamd.h, amd.h, libcolamd, libamd; SUITESPARSE_INCLUDE_DIR / SUITESPARSE_LIB_DIR)
 """
 
 import os
@@ -96,7 +96,9 @@ ss_inc = _first_dir("SUITESPARSE_INCLUDE_DIR", [os.path.join(p, "include", "suit
 ss_lib = _first_dir("SUITESPARSE_LIB_DIR", [os.path.join(p, d) for p in _prefixes for d in ("lib", "lib64", "lib/x86_64-linux-gnu")], "libcolamd.so")
 if not ss_inc or not ss_lib:
     sys.exit("setup.py: SuiteSparse COLAMD not found (colamd.h / libcolamd.so); set SUITESPARSE_INCLUDE_DIR and SUITESPARSE_LIB_DIR")
-libraries.append("colamd")
+if not os.path.exists(os.path.join(ss_lib, "libamd.so")) or not os.path.exists(os.path.join(ss_inc, "amd.h")):
+    sys.exit("setup.py: SuiteSparse AMD not found (amd.h / libamd.so) next to COLAMD")
+libraries.extend(["colamd", "amd"])
 extra_link_args.extend([f"-L{ss_lib}", f"-Wl,-rpath,{ss_lib}"])
 
 ext = Extension(

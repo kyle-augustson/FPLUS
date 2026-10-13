@@ -101,6 +101,16 @@ typedef struct fplus_symbolic fplus_symbolic;
 int fplus_analyze(int64_t n, const int64_t *Ap, const int64_t *Ai, int pin_dense, double tau_density, int64_t tau_min_nnz,
                   const unsigned char *tau_row_mask, const unsigned char *tau_col_mask, int postorder,
                   fplus_symbolic **sym, char *err, size_t errlen);
+/* fplus_analyze with a choice of the fill-reducing column order (fplus_analyze: FPLUS_ORDER_COLAMD).  FPLUS_ORDER_AMD_ATA:
+ * minimum degree (SuiteSparse AMD) on the pattern of A^T A without the dense lines.  FPLUS_ORDER_AUTO: for small sparse
+ * matrices (n <= 4096, nnz(A) <= 24 n) minimum degree when its Cholesky factor of A^T A is at least 5% smaller than COLAMD's,
+ * COLAMD otherwise. */
+#define FPLUS_ORDER_COLAMD  0
+#define FPLUS_ORDER_AMD_ATA 1
+#define FPLUS_ORDER_AUTO    2
+int fplus_analyze_ord(int64_t n, const int64_t *Ap, const int64_t *Ai, int pin_dense, double tau_density, int64_t tau_min_nnz,
+                      const unsigned char *tau_row_mask, const unsigned char *tau_col_mask, int postorder, int ordering,
+                      fplus_symbolic **sym, char *err, size_t errlen);
 void fplus_symbolic_free(fplus_symbolic *sym);
 int64_t fplus_symbolic_n(const fplus_symbolic *sym);
 int64_t fplus_symbolic_nnz(const fplus_symbolic *sym);

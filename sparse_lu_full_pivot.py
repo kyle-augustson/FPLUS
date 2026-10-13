@@ -97,7 +97,7 @@ except (ImportError, ValueError) as _e1:
         _C_EXT_ERROR = f"{_e1}; {_e2}"
 # The C extension must be the build of this source: a stale .so (an older in-tree build, or another checkout's module on
 # sys.path) would otherwise run with this Python layer and silently route around the missing entry points (audit 2026-10-10).
-_C_API_VERSION = 4   # 3: ILU drop-before-use and breakdown pivots; 4: solve plans (solve_plan, lu_solve_plan)
+_C_API_VERSION = 5   # 3: ILU drop-before-use and breakdown pivots; 4: solve plans (solve_plan, lu_solve_plan); 5: lu_solve_perm, analyze(ordering)
 if _HAVE_C_EXT and getattr(_sparse_lu_c, "API_VERSION", 0) != _C_API_VERSION:
     _C_EXT_ERROR = (f"_sparse_lu_c at {getattr(_sparse_lu_c, '__file__', '?')} has API_VERSION "
                     f"{getattr(_sparse_lu_c, 'API_VERSION', 'none')}, this source needs {_C_API_VERSION} (a stale build: rebuild it)")
@@ -165,6 +165,7 @@ def sparse_lu_full_pivot(
     gpu_min_flops: float = 5e7,
     pivot_rel: Optional[float] = None,
     postorder: bool = True,
+    ordering: str = "auto",
     _return_csc: bool = False,
 ) -> Tuple[csr_matrix, csr_matrix, np.ndarray, np.ndarray,
            np.ndarray, np.ndarray]:
@@ -310,6 +311,16 @@ def sparse_lu_full_pivot(
         supernodal kernel finds wider supernodes.  Default True (False
         restores the plain COLAMD order of earlier versions).
 
+    ordering : str, optional
+        With colamd=True: the fill-reducing column order.  "colamd"
+        (COLAMD); "amd_ata" (minimum degree, SuiteSparse AMD, on the
+        pattern of A^T A without the dense lines); "auto" (default): for
+        small sparse matrices (n <= 4096, nnz(A) <= 24 n) minimum degree when
+        its Cholesky factor of A^T A (the bound on the LU fill) is at least
+        5 percent smaller than COLAMD's, COLAMD otherwise.  On the radial pencils of
+        Dedalus / Rayleigh factored as A^T minimum degree gave 8-10
+        percent less fill.  Cached with the ordering.
+
     pivot_rel : float, optional
         Relative singular-pivot threshold: the factorization stops with
         "Matrix is singular" when the best available pivot is below
@@ -366,6 +377,8 @@ def sparse_lu_full_pivot(
             f"pivot_strategy must be 'partial', 'rook', or 'full'; "
             f"got {pivot_strategy!r}.")
     pivot_code = _PIVOT_NAMES[pivot_strategy]
+    if ordering not in _ORDERINGS:
+        raise ValueError(f"ordering must be 'colamd', 'amd_ata' or 'auto'; got {ordering!r}.")
 
     # ------------------------------------------------------------------
     # Verbose entry summary (verbose >= 1).  Prints control parameters
@@ -399,7 +412,7 @@ def sparse_lu_full_pivot(
     if colamd:
         row_perm, col_perm, tr_count, tc_count = _colamd_permutations(
             A_csc, n, pin_dense_rows, tau_density, tau_min_nnz,
-            tau_row_mask, tau_col_mask, cache=cache_ordering, postorder=postorder)
+            tau_row_mask, tau_col_mask, cache=cache_ordering, postorder=postorder, ordering=ordering)
         if verbose >= 1:
             if pin_dense_rows:
                 print(f"[FPLUS]   COLAMD: pinned {tr_count} dense rows, "
@@ -945,13 +958,17 @@ def _pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, t
     return (n, A_csr.nnz, bool(pin_dense_rows), float(tau_density), int(tau_min_nnz), h.hexdigest())
 
 
-def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, cache=True, postorder=False):
+_ORDERINGS = {"colamd": 0, "amd_ata": 1, "auto": 2}
+
+
+def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, cache=True, postorder=False,
+                         ordering="colamd"):
     """_colamd_permutations_uncached, cached by sparsity pattern (cache=True)."""
     global _ORDER_CACHE
     if not cache:
-        return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
+        return _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder, ordering)
     from collections import OrderedDict
-    key = (_pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask), bool(postorder))
+    key = (_pattern_key(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask), bool(postorder), ordering)
     # the cache is shared by threads (the C core releases the GIL): look up and insert under the lock; the analysis itself runs
     # outside it (two threads missing the same key may both analyse; the second insert is a no-op refresh)
     with _ORDER_CACHE_LOCK:
@@ -963,7 +980,7 @@ def _colamd_permutations(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row
     if hit is not None and hit[4] is not None and not np.array_equal(_canonical_csc(A).indices, hit[4]):
         hit = None                   # a fingerprint shared by another pattern: analyse, and replace the entry
     if hit is None:
-        hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder)
+        hit = _colamd_permutations_uncached(A, n, pin_dense_rows, tau_density, tau_min_nnz, tau_row_mask, tau_col_mask, postorder, ordering)
         Ac = _canonical_csc(A)
         hit = tuple(hit) + ((Ac.indices.copy() if Ac.nnz <= _ORDER_CACHE_VERIFY_NNZ else None),)
         with _ORDER_CACHE_LOCK:
@@ -985,9 +1002,11 @@ def _colamd_permutations_uncached(
     tau_row_mask: Optional[np.ndarray],
     tau_col_mask: Optional[np.ndarray],
     postorder: bool = False,
+    ordering: str = "colamd",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute the (row_perm, col_perm) pair for COLAMD preprocessing.
+    Compute the (row_perm, col_perm) pair for COLAMD preprocessing (ordering "colamd"; "amd_ata" and "auto" choose
+    another fill-reducing column order on the C route, see sparse_lu_full_pivot; the Python route is COLAMD only).
 
     row_perm : int64[n]   -- moves dense rows to the bottom (identity if
                             pin_dense_rows=False or no dense rows detected)
@@ -1013,7 +1032,7 @@ def _colamd_permutations_uncached(
     if _HAVE_C_EXT and hasattr(_sparse_lu_c, "analyze") and not _PY_PIPELINE:
         r = _sparse_lu_c.analyze(A_csr.indptr.astype(np.int64, copy=False), A_csr.indices.astype(np.int64, copy=False), n,
                                  int(bool(pin_dense_rows)), float(tau_density), int(tau_min_nnz), masks[0], masks[1],
-                                 int(bool(postorder)))
+                                 int(bool(postorder)), _ORDERINGS[ordering])
         return r["row_perm"], r["col_perm"], int(r["n_dense_rows"]), int(r["n_dense_cols"])
 
     # -- Dense row detection ------------------------------------------------
