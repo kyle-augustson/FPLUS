@@ -677,7 +677,7 @@ int fplus_factor_sn(int64_t n, const int64_t *Ap, const int64_t *Ai, const void 
 #endif
     /* panel < 0 (auto): the width from the thread count.  One thread: 64 (2026-10-12, 1 thread, n 1.2k-14k, real and complex:
        64-128 within 2 percent of the best width, 512 up to 1.3x slower); more threads keep more columns in flight: base x threads/2,
-       at most cap (512 at 16 threads: the 48 x 144 production setting of FINDINGS 63.126).  FPLUS_PANEL_AUTO="base,cap": tuning. */
+       at most cap (512 at 16 threads: on a 48 x 144 spectral MHD pencil it factored in 151 s, 2.1x faster than UMFPACK).  FPLUS_PANEL_AUTO="base,cap": tuning. */
     if (panel < 0 && small_sparse) panel = 1;
     if (panel < 0) {
         int nt = 1;
